@@ -12,6 +12,7 @@ import viser
 import viser.transforms as vt
 import cv2
 import matplotlib.cm as cm
+from matplotlib import colormaps
 
 try:
     import onnxruntime
@@ -440,7 +441,7 @@ def viser_wrapper(
 
             # Frustum
             norm_i = i/(S-1) if S>1 else 0.0
-            col   = cm.get_cmap('gist_rainbow')(norm_i)[:3]
+            col   = colormaps.get_cmap('gist_rainbow')(norm_i)[:3]
             
             # Since Pi3 doesn't provide intrinsics, we have to use a heuristic for FOV.
             # This is a limitation. A fixed FOV is a reasonable fallback.

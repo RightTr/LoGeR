@@ -484,7 +484,10 @@ def main():
                 current_frames = extract_frames_from_video(input_path, temp_dir, args.start_frame, args.end_frame, args.stride)
                 all_image_names_collected.extend(current_frames)
             elif os.path.isdir(input_path):
-                current_frames = natsorted(glob.glob(os.path.join(input_path, "*.png"))+glob.glob(os.path.join(input_path, "*.jpg"))+glob.glob(os.path.join(input_path, "*.jpeg")))
+                current_frames = natsorted(
+                    os.path.join(input_path, name) for name in os.listdir(input_path)
+                    if name.lower().endswith((".png", ".jpg", ".jpeg"))
+                )
                 # remove the files that has depth in the name
                 current_frames = [f for f in current_frames if "depth" not in os.path.basename(f).lower()]
                 end_idx = args.end_frame if args.end_frame != -1 else None
