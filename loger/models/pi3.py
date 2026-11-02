@@ -8,11 +8,13 @@ from .dinov2.layers import Mlp
 from ..utils.geometry import homogenize_points, robust_scale_estimation
 from .layers.pos_embed import RoPE2D, PositionGetter
 from .layers.block import BlockRope
-from .layers.attention import FlashAttentionRope
+from .layers.swa import SWA
+from .layers.sca import SCA
 from .layers.transformer_head import TransformerDecoder, LinearPts3d, ContextOnlyTransformerDecoder
 from .layers.camera_head import CameraHead
 from .layers.conv_head import ConvHead
-from .dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg
+from .satellite_encoder import SatelliteEncoder
+from .uav_encoder import UAVEncoder
 from huggingface_hub import PyTorchModelHubMixin
 from loger.models.ttt import FastWeightGluMLPMultihead, TTTOperator
 
@@ -32,6 +34,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             ttt_pre_norm: bool = False,
             pi3x: bool = False,
             pi3x_metric: bool = True,
+            sca_enabled: bool = False,
         ):
         super().__init__()
 
@@ -55,7 +58,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         self.attn_insert_after = parsed_attn_insert_after
         self.detach_swa_history = False
         self.initialize_swa_from_global = True
-        self.encoder = dinov2_vitl14_reg(pretrained=False)
+        self.uav_encoder = UAVEncoder(pretrained=False)
+        self.satellite_encoder = SatelliteEncoder()
         self.patch_size = 14
         self.num_muon_update_steps = int(num_muon_update_steps)
         self.num_pe_tokens = 3
@@ -65,8 +69,6 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         self.ttt_pre_norm = ttt_pre_norm
         self.pi3x = pi3x
         self.pi3x_metric = pi3x_metric
-        del self.encoder.mask_token
-
         # ----------------------
         #  Positonal Encoding
         # ----------------------
@@ -84,7 +86,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         # ----------------------
         #        Decoder
         # ----------------------
-        enc_embed_dim = self.encoder.blocks[0].attn.qkv.in_features        # 1024
+        enc_embed_dim = self.uav_encoder.embed_dim        # 1024
         if decoder_size == 'small':
             dec_embed_dim = 384
             dec_num_heads = 6
@@ -250,38 +252,66 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             TTTOperator(start=0, end=None, update=True, apply=False),
         ]
 
-        # ----------------------
-        #   Attention Adapters
-        # ----------------------
-        self.swa_layers = nn.ModuleList([
-            BlockRope(
-                dim=dec_embed_dim,
-                num_heads=dec_num_heads,
-                mlp_ratio=ttt_inter_multi,
-                qkv_bias=True,
-                proj_bias=True,
-                ffn_bias=True,
-                drop_path=0.0,
-                norm_layer=partial(nn.LayerNorm, eps=1e-6),
-                act_layer=nn.GELU,
-                ffn_layer=Mlp,
-                init_values=0.01,
-                qk_norm=True,
-                attn_class=FlashAttentionRope,
-                rope=self.rope,
+        self.swa = SWA(
+            dim=dec_embed_dim,
+            num_heads=dec_num_heads,
+            mlp_ratio=ttt_inter_multi,
+            insert_after=self.attn_insert_after,
+            rope=self.rope,
+        )
+        self.sca_enabled = bool(sca_enabled)
+        self.sca = None
+        if self.sca_enabled:
+            satellite_dim = self.satellite_encoder.projection.out_features
+            self.sca = SCA(
+                uav_dim=self.dec_embed_dim,
+                satellite_dim=satellite_dim,
+                attn_dim=256,
+                num_heads=8,
             )
-            for _ in self.attn_insert_after
-        ])
-        self.swa_gate_projs = nn.ModuleList([
-            nn.Linear(dec_embed_dim, 1)
-            for _ in self.attn_insert_after
-        ])
+            for name, parameter in self.named_parameters():
+                parameter.requires_grad_(name.startswith("sca."))
 
-        for gate_proj in self.swa_gate_projs:
-            torch.nn.init.zeros_(gate_proj.weight)
-            if gate_proj.bias is not None:
-                torch.nn.init.zeros_(gate_proj.bias)
-    
+    def encode_satellite(self, satellite_tiles):
+        """Encode a batch of SatelliteTileManager outputs."""
+        tiles = satellite_tiles["tiles"]
+        unbatched = tiles.ndim == 4
+        if unbatched:
+            tiles = tiles.unsqueeze(0)
+        batch, tile_count = tiles.shape[:2]
+        encoded = self.satellite_encoder(tiles.flatten(0, 1))
+        result = {
+            key: value.reshape(batch, tile_count * value.shape[1], -1)
+            for key, value in encoded.items()
+        }
+        for key in ("tile_origins", "pixel_valid_mask", "patch_map_coords", "pool_map_coords",
+                    "patch_valid_mask", "pool_valid_mask"):
+            if key in satellite_tiles:
+                value = satellite_tiles[key]
+                if unbatched:
+                    value = value.unsqueeze(0)
+                if key in ("patch_map_coords", "pool_map_coords", "patch_valid_mask", "pool_valid_mask"):
+                    value = value.flatten(1, 2)
+                result[key] = value
+        return result
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Load checkpoints using UAVEncoder's key compatibility mapping."""
+        remapped = SWA.remap_state_dict(UAVEncoder.remap_state_dict(state_dict))
+        if self.sca is not None and "sca.query_norm.weight" in remapped:
+            if remapped["sca.query_norm.weight"].shape != self.sca.query_norm.weight.shape:
+                for key in list(remapped):
+                    if key.startswith("sca."):
+                        del remapped[key]
+        incompatible = super().load_state_dict(remapped, strict=False, assign=assign)
+        if strict:
+            allowed = ("satellite_encoder.", "sca.")
+            missing = [key for key in incompatible.missing_keys if not key.startswith(allowed)]
+            unexpected = incompatible.unexpected_keys
+            if missing or unexpected:
+                raise RuntimeError(f"Error loading state_dict: missing={missing}, unexpected={unexpected}")
+        return incompatible
+
     def _initialize_ttt_layers_from_global(
         self,
         layers: Optional[nn.ModuleList],
@@ -325,12 +355,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             print(f"  Initialized {kind}_layer[{layer_idx}] from decoder[{decoder_idx}]")
 
     def _initialize_swa_from_global(self):
-        if self.swa_layers is None:
+        if not self.swa.layers:
             return
-        self._initialize_ttt_layers_from_global(self.swa_layers, "swa", self.attn_insert_after)
+        self._initialize_ttt_layers_from_global(self.swa.layers, "swa", self.attn_insert_after)
 
     def decode(self, hidden, N, H, W, ttt_dict: Optional[dict] = None, window_size: Optional[int] = None, overlap_size: Optional[int] = None, is_first_window: bool = False,
-               turn_off_ttt=False, turn_off_swa=False) -> torch.Tensor:
+               turn_off_ttt=False, turn_off_swa=False, satellite_memory=None, return_satellite_attention=False) -> torch.Tensor:
         BN, hw, _ = hidden.shape
         B = BN // N
 
@@ -370,6 +400,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             pos = torch.cat([pos_special, pos], dim=1)
        
         ttt_output_info = None
+        satellite_info = None
         ttt_state = ttt_dict.get("ttt") if ttt_dict is not None else None
         attn_state = ttt_dict.get("attn") if ttt_dict is not None else None
         gate_scales: List[torch.Tensor] = []
@@ -448,108 +479,33 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
             # Sliding Window Attention (SWA)
             if attn_state is not None and i in attn_state.get("insert_after", []):
-                assert self.swa_gate_projs is not None and self.swa_layers is not None
                 insert_after_list = attn_state.get("insert_after", [])
                 layer_idx = insert_after_list.index(i)
-
-                patch_tokens_post_block = hidden
-                x_for_residual = patch_tokens_post_block.view(B, N, hw, -1)
-                x_in = x_for_residual
-
+                if i == min(insert_after_list) and satellite_memory is not None:
+                    hidden, satellite_info = self.sca(
+                        hidden.reshape(B * N, hw, -1), B, N, self.patch_start_idx,
+                        satellite_memory, return_attention=return_satellite_attention,
+                    )
                 history_list = attn_state.get("history", [None] * len(insert_after_list))
                 history = history_list[layer_idx]
-                x_in_for_layer = x_in
-
-                # Prepare position embeddings for current tokens
-                if pos is not None:
-                    pos_current = pos.reshape(B, N, hw, -1).reshape(B, N * hw, -1)
-                else:
-                    pos_current = None
-
-                # Check if we have KV cache from history
-                use_kv_cache = (
-                    history is not None 
-                    and isinstance(history, dict) 
-                    and "k" in history
+                x_for_residual = hidden.view(B, N, hw, -1)
+                x_out_patch, gate_scale, new_history = self.swa.forward_layer(
+                    layer_idx,
+                    x_for_residual,
+                    pos.reshape(B, N * hw, -1) if pos is not None else None,
+                    history=history,
+                    detach_history=self.detach_swa_history,
+                    turn_off=turn_off_swa,
                 )
-
-                if use_kv_cache:
-                    # Use KV cache path
-                    k_cache = history["k"]  # [B, num_heads, N_hist * hw, head_dim]
-                    v_cache = history["v"]  # [B, num_heads, N_hist * hw, head_dim]
-                    # Forward with KV cache
-                    x_curr_flat = x_in_for_layer.reshape(B, N * hw, -1)
-                    swa_output_flat = self.swa_layers[layer_idx].forward_with_kv_cache(
-                        x_curr_flat, k_cache, v_cache,
-                        xpos=pos_current,
-                    )
-                    swa_output = swa_output_flat.reshape(B, N, hw, -1)
-                else:
-                    # Original path (no history or legacy format)
-                    # Handle legacy history format (raw tensor instead of dict)
-                    history_raw = history if history is not None and not isinstance(history, dict) else None
-
-                    if history_raw is not None:
-                        x_with_history = torch.cat([history_raw, x_in_for_layer], dim=1)
-                    else:
-                        x_with_history = x_in_for_layer
-
-                    N_total = x_with_history.shape[1]
-                    x_swa = x_with_history.reshape(B, N_total * hw, -1)
-
-                    if pos is not None:
-                        pos_swa = pos.reshape(B, N, hw, -1)
-                        if history_raw is not None:
-                            N_hist = history_raw.shape[1]
-                            pos_hist = pos_swa[:, :1].repeat(1, N_hist, 1, 1)
-                            pos_swa = torch.cat([pos_hist, pos_swa], dim=1)
-                        pos_swa = pos_swa.reshape(B, N_total * hw, -1)
-                    else:
-                        pos_swa = None
-
-                    swa_output_full = self.swa_layers[layer_idx](
-                        x_swa, 
-                        xpos=pos_swa, 
-                    )
-                    swa_output_full = swa_output_full.reshape(B, N_total, hw, x_in.shape[-1])
-                    if history_raw is not None:
-                        N_hist = history_raw.shape[1]
-                        swa_output = swa_output_full[:, N_hist:, :, :]
-                    else:
-                        swa_output = swa_output_full
-
-                gate_scale = torch.nn.functional.silu(self.swa_gate_projs[layer_idx](swa_output))
-                if turn_off_swa: gate_scale = torch.zeros_like(gate_scale)
                 attn_gate_scales.append(gate_scale)
 
-                update_term = swa_output * gate_scale
-                x_out_patch = update_term + x_for_residual
-                x_out_patch_flat = x_out_patch.reshape(B, N * hw, -1)
-                hidden = x_out_patch_flat.reshape(B * N, hw, -1)
-
                 # Store KV cache for next window
-                # Compute KV for current x_in with history_pe (since it will be history next time)
                 if ttt_output_info is None:
                     ttt_output_info = {"history": [None] * len(insert_after_list)}
                 elif "history" not in ttt_output_info:
                     ttt_output_info["history"] = [None] * len(insert_after_list)
-
-                x_for_cache = x_in
-                x_for_cache_flat = x_for_cache.reshape(B, N * hw, -1)
-                
-                # Position for cache: use first frame's position repeated (same as original logic)
-                if pos is not None:
-                    pos_for_cache = pos.reshape(B, N, hw, -1)[:, :1].repeat(1, N, 1, 1).reshape(B, N * hw, -1)
-                else:
-                    pos_for_cache = None
-
-                k_new, v_new = self.swa_layers[layer_idx].compute_kv_cache(x_for_cache_flat, xpos=pos_for_cache)
-                
-                if getattr(self, "detach_swa_history", False):
-                    k_new = k_new.detach()
-                    v_new = v_new.detach()
-                
-                ttt_output_info["history"][layer_idx] = {"k": k_new, "v": v_new}
+                ttt_output_info["history"][layer_idx] = new_history
+                hidden = x_out_patch.reshape(B * N, hw, -1)
 
             if i+1 in [len(self.decoder)-1, len(self.decoder)]:
                 final_output.append(hidden.reshape(B*N, hw, -1))
@@ -577,10 +533,13 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             avg_gate_scale,
             avg_attn_gate_scale,
             gate_scales,
+            satellite_info,
         )
     
     def forward(self, imgs, *args, **kwargs):
         # Windowing controls (optional)
+        satellite_tiles = kwargs.pop("satellite_tiles", None)
+        satellite_features = kwargs.pop("satellite_features", None)
         window_size = kwargs.pop('window_size', -1)
         overlap_size = kwargs.pop('overlap_size', 1)
         num_iterations = kwargs.pop('num_iterations', 1)
@@ -591,6 +550,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         turn_off_ttt = kwargs.pop('turn_off_ttt', False)
         turn_off_swa = kwargs.pop('turn_off_swa', False)
         sim3_scale_mode = kwargs.pop('sim3_scale_mode', 'median')
+        return_satellite_attention = kwargs.pop("return_satellite_attention", False)
 
         if sim3 and se3:
             raise ValueError("'sim3' and 'se3' alignments are mutually exclusive; enable only one.")
@@ -618,6 +578,22 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
         B, N, C, H, W = imgs.shape
         patch_h, patch_w = H // 14, W // 14
+
+        satellite_memory = None
+        if self.sca_enabled:
+            satellite_features = (
+                self.encode_satellite(satellite_tiles)
+                if satellite_tiles is not None else satellite_features
+            )
+            satellite_dtype = next(self.sca.parameters()).dtype
+            satellite_tokens = satellite_features["projected_tokens"].to(
+                device=self.image_mean.device, dtype=satellite_dtype
+            )
+            satellite_coords = satellite_features["pool_map_coords"].to(self.image_mean.device)
+            satellite_mask = satellite_features["pool_valid_mask"].to(self.image_mean.device)
+            satellite_memory = self.sca.prepare_satellite(
+                satellite_tokens, satellite_coords, satellite_mask
+            )
 
         # --- Unified Windowed Inference ---
         if window_size <= 0 or window_size >= N:
@@ -649,7 +625,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             w0 = w1 = w2 = None
 
         # Prepare SWA history states across windows
-        swa_history = [None] * len(self.attn_insert_after) if self.swa_layers is not None else None
+        swa_history = [None] * len(self.attn_insert_after) if self.swa.layers else None
 
         def reset_adaptive_states():
             """Reset fast-weight TTT states only; SWA history is preserved across resets."""
@@ -662,6 +638,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         all_predictions = []
         all_gate_scales: List[torch.Tensor] = []
         all_attn_gate_scales: List[torch.Tensor] = []
+        all_satellite_attention = []
         
         windows_iter = windows
         for window_idx, (start_idx, end_idx) in enumerate(windows_iter):
@@ -676,17 +653,17 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             hidden = None  # type: ignore[assignment]
             pos = None     # type: ignore[assignment]
 
-            for _ in range(num_iterations):
+            for iteration in range(num_iterations):
                 if self.ttt_layers is not None and w0 is None:
                     w0 = [None] * len(self.ttt_insert_after)
                     w1 = [None] * len(self.ttt_insert_after)
                     w2 = [None] * len(self.ttt_insert_after)
 
-                if self.swa_layers is not None and swa_history is None:
+                if self.swa.layers and swa_history is None:
                     swa_history = [None] * len(self.attn_insert_after)
 
                 imgs_flat = imgs_w.reshape(B * Nw, C, H, W)
-                hidden_input = self.encoder(imgs_flat, is_training=True)
+                hidden_input = self.uav_encoder(imgs_flat, is_training=True)
                 if isinstance(hidden_input, dict):
                     hidden_input = hidden_input["x_norm_patchtokens"]
 
@@ -703,7 +680,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "w2": w2,
                     }
 
-                if self.swa_layers is not None:
+                if self.swa.layers:
                     attn_state = {
                         "insert_after": self.attn_insert_after,
                         "history": swa_history,
@@ -716,7 +693,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "ttt": ttt_state,
                         "attn": attn_state,
                     }
-                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales = self.decode(
+                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, satellite_info = self.decode(
                     hidden_input, Nw, H, W,
                     ttt_dict=ttt_dict,
                     window_size=window_size,
@@ -724,6 +701,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     is_first_window=(start_idx == 0),
                     turn_off_ttt=turn_off_ttt,
                     turn_off_swa=turn_off_swa,
+                    satellite_memory=satellite_memory if iteration == num_iterations - 1 else None,
+                    return_satellite_attention=return_satellite_attention,
                 )
                 if decode_avg_gate_scale is not None:
                     all_gate_scales.append(decode_avg_gate_scale.detach().cpu())
@@ -741,6 +720,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             # If for some reason decoding didn't produce hidden (e.g., empty window), skip this window
             if hidden is None:
                 continue
+
+            if satellite_info is not None:
+                all_satellite_attention.append(satellite_info)
 
             point_hidden = self.point_decoder(hidden, xpos=pos)
             if self.use_conf and self.conf_decoder is not None:
@@ -847,6 +829,15 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
         if all_attn_gate_scales:
             merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
+        if all_satellite_attention:
+            for name in ("mid_attention", "fine_attention"):
+                parts = [info[name][:, :-eff_overlap] if eff_overlap else info[name]
+                         for info in all_satellite_attention[:-1]
+                         if not eff_overlap or info[name].shape[1] > eff_overlap]
+                merged[name] = torch.cat(parts + [all_satellite_attention[-1][name]], dim=1)
+            merged["satellite_attention"] = merged["fine_attention"]
+            merged["satellite_attention_coords"] = all_satellite_attention[-1]["fine_coords"]
+            merged["satellite_mid_coords"] = all_satellite_attention[-1]["mid_coords"]
         
         return merged
 
