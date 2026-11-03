@@ -1,6 +1,5 @@
-"""Sequence indexing and on-demand video decoding for frame and window datasets."""
+"""Shared video indexing and decoding for sequence datasets."""
 
-import os
 from pathlib import Path
 
 import cv2
@@ -9,129 +8,79 @@ from torch.utils.data import Dataset
 
 
 class BaseSequenceDataset(Dataset):
-    def __init__(
-        self,
-        root,
-        mode="window",
-        window_size=8,
-        stride=4,
-        frame_step=1,
-        image_size=(280, 504),
-        scenes=None,
-        frame_range=None,
-        transform=None,
-    ):
-        if mode not in ("frame", "window"):
-            raise ValueError("mode must be 'frame' or 'window'")
-        if min(window_size, stride, frame_step) < 1:
-            raise ValueError("window_size, stride and frame_step must be positive")
-
-        self.root = Path(root)
+    def __init__(self, sequence_paths, mode="window", window_size=8, stride=4,
+                 frame_step=1, image_size=(280, 504), frame_range=None, transform=None):
         self.mode = mode
-        self.window_size = window_size
-        self.stride = stride
-        self.frame_step = frame_step
-        self.image_size = image_size
+        self.image_size = tuple(image_size)
         self.transform = transform
         self._captures = {}
-        self._capture_positions = {}
-        self._capture_pid = os.getpid()
-
-        selected = set(scenes) if scenes is not None else None
-        self.sequences = {}
+        self.sequence_fps = {}
         self.index = []
-        for sequence in self._discover_sequences():
+        self.indices_by_scene = {}
+
+        for sequence in sequence_paths:
+            sequence = Path(sequence)
             scene = sequence.parent.name
-            if selected is not None and scene not in selected:
-                continue
-            records = self._load_records(sequence)
+            video_path = sequence / "video.mp4"
+            capture = cv2.VideoCapture(str(video_path))
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.sequence_fps[sequence] = capture.get(cv2.CAP_PROP_FPS)
+            capture.release()
+            ids = self._index_frame_ids(sequence, frame_count)
             if frame_range is not None:
                 start, stop = frame_range
-                records = [r for r in records if start <= r["frame_id"] < stop]
-            if not records:
+                ids = [frame_id for frame_id in ids if start <= frame_id < stop]
+            if not ids:
                 continue
-            self.sequences[sequence] = records
-            if mode == "frame":
-                self.index.extend((sequence, (i,)) for i in range(len(records)))
-            else:
-                span = (window_size - 1) * frame_step + 1
-                self.index.extend(
-                    (sequence, tuple(range(start, start + span, frame_step)))
-                    for start in range(0, len(records) - span + 1, stride)
-                )
+            entries = self._make_entries(sequence, ids, mode, window_size, stride, frame_step)
+            self.indices_by_scene.setdefault(scene, []).extend(
+                range(len(self.index), len(self.index) + len(entries))
+            )
+            self.index.extend(entries)
 
-    def _discover_sequences(self):
-        raise NotImplementedError
-
-    def _load_records(self, sequence):
-        raise NotImplementedError
-
-    def _load_frame(self, sequence, record):
-        raise NotImplementedError
+    @staticmethod
+    def _make_entries(sequence, frame_ids, mode, window_size, stride, frame_step):
+        if mode == "frame":
+            return [(sequence, (frame_id,)) for frame_id in frame_ids]
+        available = set(frame_ids)
+        return [
+            (sequence, tuple(frame_id + i * frame_step for i in range(window_size)))
+            for frame_id in frame_ids[::stride]
+            if all(frame_id + i * frame_step in available for i in range(window_size))
+        ]
 
     def __len__(self):
         return len(self.index)
 
-    def _capture(self, sequence):
-        if self._capture_pid != os.getpid():
-            self.close()
-            self._capture_pid = os.getpid()
-        if sequence not in self._captures:
-            capture = cv2.VideoCapture(str(sequence / "video.mp4"))
-            if not capture.isOpened():
-                raise RuntimeError(f"Cannot open video: {sequence / 'video.mp4'}")
-            self._captures[sequence] = capture
-            self._capture_positions[sequence] = None
-        return self._captures[sequence]
-
-    def _read_rgb(self, sequence, frame_id):
-        capture = self._capture(sequence)
-        if self._capture_positions[sequence] != frame_id:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
-        ok, frame = capture.read()
-        self._capture_positions[sequence] = frame_id + 1 if ok else None
-        if not ok:
-            raise RuntimeError(f"Cannot decode {sequence} frame_id={frame_id}")
-        height, width = self.image_size
-        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb = torch.from_numpy(frame.copy()).permute(2, 0, 1).float() / 255
-        return self.transform(rgb) if self.transform is not None else rgb
+    def get_scene_metadata(self, scene):
+        sequence, _ = self.index[self.indices_by_scene[scene][0]]
+        return {"name": scene, "path": str(sequence), "variant": sequence.name}
 
     def __getitem__(self, index):
-        sequence, positions = self.index[index]
-        records = self.sequences[sequence]
-        capture = self._capture(sequence)
-        fps = capture.get(cv2.CAP_PROP_FPS)
-        items = []
-        for position in positions:
-            record = records[position]
-            item = self._load_frame(sequence, record)
-            item["rgb"] = self._read_rgb(sequence, record["frame_id"])
-            item["frame_ids"] = torch.tensor(record["frame_id"], dtype=torch.long)
-            item["timestamps"] = torch.tensor(record["frame_id"] / fps, dtype=torch.float64)
-            items.append(item)
+        sequence, frame_ids = self.index[index]
+        fps = self.sequence_fps[sequence]
 
-        sample = {key: torch.stack([item[key] for item in items]) for key in items[0]}
+        sample = {
+            "frame_ids": torch.tensor(frame_ids, dtype=torch.long),
+            "timestamps": torch.tensor([frame_id / fps for frame_id in frame_ids], dtype=torch.float64),
+            "scene": sequence.parent.name,
+            "variant": sequence.name,
+        }
+        sample["rgb"] = self.load_images(sequence, frame_ids)
+        sample.update(self.load_requested_fields(sequence, frame_ids))
+
         if self.mode == "frame":
-            sample = {key: value[0] for key, value in sample.items()}
-        sample["scene"] = sequence.parent.name
-        sample["variant"] = sequence.name
+            for field in ("rgb", "frame_ids", "timestamps"):
+                if field in sample and torch.is_tensor(sample[field]):
+                    sample[field] = sample[field][0]
         return sample
 
     def close(self):
-        for capture in self._captures.values():
+        for capture, _ in self._captures.values():
             capture.release()
         self._captures.clear()
-        self._capture_positions.clear()
 
     def __getstate__(self):
         state = self.__dict__.copy()
         state["_captures"] = {}
-        state["_capture_positions"] = {}
-        state["_capture_pid"] = None
         return state
-
-    def __del__(self):
-        if hasattr(self, "_captures"):
-            self.close()
