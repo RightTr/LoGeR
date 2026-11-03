@@ -10,6 +10,7 @@ from .layers.pos_embed import RoPE2D, PositionGetter
 from .layers.block import BlockRope
 from .layers.swa import SWA
 from .layers.sca import SCA
+from .layers.pyramid_attention import PyramidAttention
 from .layers.transformer_head import TransformerDecoder, LinearPts3d, ContextOnlyTransformerDecoder
 from .layers.camera_head import CameraHead
 from .layers.conv_head import ConvHead
@@ -35,6 +36,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             pi3x: bool = False,
             pi3x_metric: bool = True,
             sca_enabled: bool = False,
+            pyramid_attention_enabled: bool = False,
         ):
         super().__init__()
 
@@ -260,9 +262,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             rope=self.rope,
         )
         self.sca_enabled = bool(sca_enabled)
+        self.pyramid_attention_enabled = bool(pyramid_attention_enabled)
+        if self.sca_enabled and self.pyramid_attention_enabled:
+            raise ValueError("SCA and pyramid attention cannot be enabled together")
         self.sca = None
         if self.sca_enabled:
-            satellite_dim = self.satellite_encoder.projection.out_features
+            satellite_dim = self.satellite_encoder.backbone.embed_dim
             self.sca = SCA(
                 uav_dim=self.dec_embed_dim,
                 satellite_dim=satellite_dim,
@@ -271,41 +276,65 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             )
             for name, parameter in self.named_parameters():
                 parameter.requires_grad_(name.startswith("sca."))
+        self.pyramid_attention = None
+        if self.pyramid_attention_enabled:
+            self.pyramid_attention = PyramidAttention(self.dec_embed_dim, self.satellite_encoder.backbone.embed_dim)
+            for name, parameter in self.named_parameters():
+                parameter.requires_grad_(name.startswith("pyramid_attention."))
+
+    def encode_pyramid(self, pyramid):
+        """Encode the full DOP once and the nine local tiles once."""
+        global_features = self.satellite_encoder(pyramid["global_tile"][None])["pool_tokens"]
+        local = pyramid["local"]
+        local_features = self.satellite_encoder(local["tiles"])
+        return {
+            "L0": {"tokens": global_features, "coords": pyramid["global_coords"][None],
+                   "mask": pyramid["global_valid"][None]},
+            "L1": {"tokens": local_features["pool_tokens"].reshape(1, -1, local_features["pool_tokens"].shape[-1]),
+                   "coords": local["pool_map_coords"].reshape(1, -1, 2),
+                   "mask": local["pool_valid_mask"].reshape(1, -1)},
+            "L2": {"tokens": local_features["patch_tokens"].reshape(1, -1, local_features["patch_tokens"].shape[-1]),
+                   "coords": local["patch_map_coords"].reshape(1, -1, 2),
+                   "mask": local["patch_valid_mask"].reshape(1, -1)},
+        }
 
     def encode_satellite(self, satellite_tiles):
-        """Encode a batch of SatelliteTileManager outputs."""
+        """Encode satellite tiles once for reuse across UAV chunks."""
         tiles = satellite_tiles["tiles"]
-        unbatched = tiles.ndim == 4
-        if unbatched:
+        coords = satellite_tiles["pool_map_coords"]
+        mask = satellite_tiles["pool_valid_mask"]
+        if tiles.ndim == 4:
             tiles = tiles.unsqueeze(0)
+            coords = coords.unsqueeze(0)
+            mask = mask.unsqueeze(0)
         batch, tile_count = tiles.shape[:2]
-        encoded = self.satellite_encoder(tiles.flatten(0, 1))
-        result = {
-            key: value.reshape(batch, tile_count * value.shape[1], -1)
-            for key, value in encoded.items()
+        pooled = self.satellite_encoder(tiles.flatten(0, 1))["pool_tokens"]
+        return {
+            "pool_tokens": pooled.reshape(batch, tile_count * pooled.shape[1], -1),
+            "pool_map_coords": coords.flatten(1, 2),
+            "pool_valid_mask": mask.flatten(1, 2),
         }
-        for key in ("tile_origins", "pixel_valid_mask", "patch_map_coords", "pool_map_coords",
-                    "patch_valid_mask", "pool_valid_mask"):
-            if key in satellite_tiles:
-                value = satellite_tiles[key]
-                if unbatched:
-                    value = value.unsqueeze(0)
-                if key in ("patch_map_coords", "pool_map_coords", "patch_valid_mask", "pool_valid_mask"):
-                    value = value.flatten(1, 2)
-                result[key] = value
-        return result
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         """Load checkpoints using UAVEncoder's key compatibility mapping."""
         remapped = SWA.remap_state_dict(UAVEncoder.remap_state_dict(state_dict))
-        if self.sca is not None and "sca.query_norm.weight" in remapped:
-            if remapped["sca.query_norm.weight"].shape != self.sca.query_norm.weight.shape:
-                for key in list(remapped):
-                    if key.startswith("sca."):
-                        del remapped[key]
+        if "sca.lambda_mid" in remapped or "sca.film.0.weight" in remapped:
+            for key in list(remapped):
+                if key.startswith("sca."):
+                    del remapped[key]
+        if self.sca is not None:
+            current = self.state_dict()
+            for key in list(remapped):
+                if key.startswith("sca.") and (key not in current or remapped[key].shape != current[key].shape):
+                    del remapped[key]
+        for key in list(remapped):
+            if (key.startswith("satellite_encoder.projection.") or
+                    (self.sca is None and key.startswith("sca.")) or
+                    (self.pyramid_attention is None and key.startswith("pyramid_attention."))):
+                del remapped[key]
         incompatible = super().load_state_dict(remapped, strict=False, assign=assign)
         if strict:
-            allowed = ("satellite_encoder.", "sca.")
+            allowed = ("satellite_encoder.", "sca.", "pyramid_attention.")
             missing = [key for key in incompatible.missing_keys if not key.startswith(allowed)]
             unexpected = incompatible.unexpected_keys
             if missing or unexpected:
@@ -360,7 +389,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         self._initialize_ttt_layers_from_global(self.swa.layers, "swa", self.attn_insert_after)
 
     def decode(self, hidden, N, H, W, ttt_dict: Optional[dict] = None, window_size: Optional[int] = None, overlap_size: Optional[int] = None, is_first_window: bool = False,
-               turn_off_ttt=False, turn_off_swa=False, satellite_memory=None, return_satellite_attention=False) -> torch.Tensor:
+               turn_off_ttt=False, turn_off_swa=False, satellite_memory=None, pyramid_memory=None) -> torch.Tensor:
         BN, hw, _ = hidden.shape
         B = BN // N
 
@@ -400,7 +429,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             pos = torch.cat([pos_special, pos], dim=1)
        
         ttt_output_info = None
-        satellite_info = None
+        pyramid_maps = None
         ttt_state = ttt_dict.get("ttt") if ttt_dict is not None else None
         attn_state = ttt_dict.get("attn") if ttt_dict is not None else None
         gate_scales: List[torch.Tensor] = []
@@ -482,9 +511,13 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 insert_after_list = attn_state.get("insert_after", [])
                 layer_idx = insert_after_list.index(i)
                 if i == min(insert_after_list) and satellite_memory is not None:
-                    hidden, satellite_info = self.sca(
+                    hidden = self.sca(
                         hidden.reshape(B * N, hw, -1), B, N, self.patch_start_idx,
-                        satellite_memory, return_attention=return_satellite_attention,
+                        satellite_memory,
+                    )
+                if i == min(insert_after_list) and pyramid_memory is not None:
+                    pyramid_maps = self.pyramid_attention(
+                        hidden.reshape(B * N, hw, -1), B, N, self.patch_start_idx, pyramid_memory,
                     )
                 history_list = attn_state.get("history", [None] * len(insert_after_list))
                 history = history_list[layer_idx]
@@ -533,12 +566,13 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             avg_gate_scale,
             avg_attn_gate_scale,
             gate_scales,
-            satellite_info,
+            pyramid_maps,
         )
     
     def forward(self, imgs, *args, **kwargs):
         # Windowing controls (optional)
         satellite_tiles = kwargs.pop("satellite_tiles", None)
+        pyramid_features = kwargs.pop("pyramid_features", None)
         satellite_features = kwargs.pop("satellite_features", None)
         window_size = kwargs.pop('window_size', -1)
         overlap_size = kwargs.pop('overlap_size', 1)
@@ -550,7 +584,6 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         turn_off_ttt = kwargs.pop('turn_off_ttt', False)
         turn_off_swa = kwargs.pop('turn_off_swa', False)
         sim3_scale_mode = kwargs.pop('sim3_scale_mode', 'median')
-        return_satellite_attention = kwargs.pop("return_satellite_attention", False)
 
         if sim3 and se3:
             raise ValueError("'sim3' and 'se3' alignments are mutually exclusive; enable only one.")
@@ -586,7 +619,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 if satellite_tiles is not None else satellite_features
             )
             satellite_dtype = next(self.sca.parameters()).dtype
-            satellite_tokens = satellite_features["projected_tokens"].to(
+            satellite_tokens = satellite_features["pool_tokens"].to(
                 device=self.image_mean.device, dtype=satellite_dtype
             )
             satellite_coords = satellite_features["pool_map_coords"].to(self.image_mean.device)
@@ -594,6 +627,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             satellite_memory = self.sca.prepare_satellite(
                 satellite_tokens, satellite_coords, satellite_mask
             )
+        pyramid_memory = None
+        if self.pyramid_attention_enabled:
+            pyramid_memory = {
+                name: {key: value.to(self.image_mean.device) for key, value in level.items()}
+                for name, level in pyramid_features.items()
+            }
 
         # --- Unified Windowed Inference ---
         if window_size <= 0 or window_size >= N:
@@ -638,7 +677,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         all_predictions = []
         all_gate_scales: List[torch.Tensor] = []
         all_attn_gate_scales: List[torch.Tensor] = []
-        all_satellite_attention = []
+        all_pyramid_maps = []
         
         windows_iter = windows
         for window_idx, (start_idx, end_idx) in enumerate(windows_iter):
@@ -693,7 +732,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "ttt": ttt_state,
                         "attn": attn_state,
                     }
-                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, satellite_info = self.decode(
+                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, pyramid_maps = self.decode(
                     hidden_input, Nw, H, W,
                     ttt_dict=ttt_dict,
                     window_size=window_size,
@@ -702,7 +741,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     turn_off_ttt=turn_off_ttt,
                     turn_off_swa=turn_off_swa,
                     satellite_memory=satellite_memory if iteration == num_iterations - 1 else None,
-                    return_satellite_attention=return_satellite_attention,
+                    pyramid_memory=pyramid_memory if iteration == num_iterations - 1 else None,
                 )
                 if decode_avg_gate_scale is not None:
                     all_gate_scales.append(decode_avg_gate_scale.detach().cpu())
@@ -720,9 +759,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             # If for some reason decoding didn't produce hidden (e.g., empty window), skip this window
             if hidden is None:
                 continue
-
-            if satellite_info is not None:
-                all_satellite_attention.append(satellite_info)
+            if pyramid_maps is not None:
+                all_pyramid_maps.append(pyramid_maps)
 
             point_hidden = self.point_decoder(hidden, xpos=pos)
             if self.use_conf and self.conf_decoder is not None:
@@ -829,16 +867,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
         if all_attn_gate_scales:
             merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
-        if all_satellite_attention:
-            for name in ("mid_attention", "fine_attention"):
-                parts = [info[name][:, :-eff_overlap] if eff_overlap else info[name]
-                         for info in all_satellite_attention[:-1]
-                         if not eff_overlap or info[name].shape[1] > eff_overlap]
-                merged[name] = torch.cat(parts + [all_satellite_attention[-1][name]], dim=1)
-            merged["satellite_attention"] = merged["fine_attention"]
-            merged["satellite_attention_coords"] = all_satellite_attention[-1]["fine_coords"]
-            merged["satellite_mid_coords"] = all_satellite_attention[-1]["mid_coords"]
-        
+        if all_pyramid_maps:
+            merged["pyramid_attention"] = {
+                name: torch.cat([maps[name][:, :-eff_overlap] for maps in all_pyramid_maps[:-1]]
+                                + [all_pyramid_maps[-1][name]], dim=1)
+                for name in ("L0", "L1", "L2")
+            }
         return merged
 
     def _merge_windowed_predictions(self, all_predictions, window_size, overlap_size):

@@ -18,3 +18,5 @@ roma
 evo
 accelerate
 rasterio
+pyyaml
+tensorboard
