@@ -33,22 +33,3 @@ def overlay(image, original, weights, coords):
     heat = cv2.applyColorMap((density * 255).astype(np.uint8), cv2.COLORMAP_JET)
     return cv2.cvtColor(cv2.addWeighted(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 0.55,
                                         heat, 0.45, 0), cv2.COLOR_BGR2RGB)
-
-
-def trajectory(image, original, gt, predicted):
-    panel = image.copy()
-    sx, sy = image.shape[1] / original[0], image.shape[0] / original[1]
-    for points, color in ((gt, (0, 255, 0)), (predicted, (255, 0, 0))):
-        pixels = np.round(points * (sx, sy)).astype(np.int32)
-        cv2.polylines(panel, [pixels], False, color, 2)
-        for pixel in pixels:
-            cv2.circle(panel, tuple(pixel), 3, color, -1)
-    return panel.transpose(2, 0, 1)
-
-
-def mark(image, original, gt, predicted):
-    panel = image.copy()
-    sx, sy = image.shape[1] / original[0], image.shape[0] / original[1]
-    for point, color in ((gt, (0, 255, 0)), (predicted, (255, 0, 0))):
-        cv2.circle(panel, (round(point[0] * sx), round(point[1] * sy)), 5, color, -1)
-    return panel

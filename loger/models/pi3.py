@@ -289,12 +289,13 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "pool_map_coords": coords.flatten(1, 2),
             "pool_valid_mask": mask.flatten(1, 2),
             "tile_origins": satellite_tiles["tile_origins"],
+            "dop_size": satellite_tiles["dop_size"],
         }
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         """Load checkpoints using UAVEncoder's key compatibility mapping."""
         remapped = SWA.remap_state_dict(UAVEncoder.remap_state_dict(state_dict))
-        if any(key in remapped for key in ("sca.lambda_mid", "sca.film.0.weight", "sca.value.weight")):
+        if any(key in remapped for key in ("sca.lambda_mid", "sca.film.0.weight", "sca.log_temperature")):
             for key in list(remapped):
                 if key.startswith("sca."):
                     del remapped[key]
@@ -487,7 +488,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 insert_after_list = attn_state.get("insert_after", [])
                 layer_idx = insert_after_list.index(i)
                 if i == min(insert_after_list) and satellite_memory is not None:
-                    satellite_maps = self.sca(
+                    hidden, satellite_maps = self.sca(
                         hidden.reshape(B * N, hw, -1), B, N, self.patch_start_idx,
                         (H // self.patch_size, W // self.patch_size), satellite_memory,
                     )
@@ -592,6 +593,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             satellite_memory = {
                 "tokens": satellite_features["pool_tokens"].to(self.image_mean.device),
                 "mask": satellite_features["pool_valid_mask"].to(self.image_mean.device),
+                "coords": satellite_features["pool_map_coords"].to(self.image_mean.device),
+                "dop_size": satellite_features["dop_size"].to(self.image_mean.device),
             }
 
         # --- Unified Windowed Inference ---
@@ -828,9 +831,6 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
         if all_satellite_maps:
             merged["satellite_attention"] = {
-                "spatial": torch.cat([maps["spatial"][:, :-eff_overlap] if eff_overlap else maps["spatial"]
-                                      for maps in all_satellite_maps[:-1]]
-                                     + [all_satellite_maps[-1]["spatial"]], dim=1),
                 "frame": torch.cat([maps["frame"][:, :-eff_overlap] if eff_overlap else maps["frame"]
                                     for maps in all_satellite_maps[:-1]]
                                    + [all_satellite_maps[-1]["frame"]], dim=1),

@@ -93,6 +93,7 @@ class SatelliteTileManager:
             "pool_map_coords": pooled_coords,
             "patch_valid_mask": patch_valid,
             "pool_valid_mask": pooled_valid,
+            "dop_size": torch.tensor((dataset.width, dataset.height), dtype=torch.float32),
         }
 
     def close(self):

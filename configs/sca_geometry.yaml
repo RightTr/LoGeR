@@ -1,10 +1,12 @@
 model_config: ckpts/LoGeR/original_config.yaml
 weights: ckpts/LoGeR/latest.pt
-log_dir: runs/sca_stage1
+log_dir: runs/sca_geometry
 epochs: 10
+warmup_epochs: 2
 learning_rate: 0.0001
 window_size: 8
-chunk_weight: 0.5
+overlap_size: 2
+lambda_global: 0.5
 train:
   - scene: /path/to/train/scene
     dop: /path/to/train/dop.tif

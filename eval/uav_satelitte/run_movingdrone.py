@@ -1,5 +1,6 @@
 """Run LoGeR on MovingDrone sequences and evaluate camera centers after Sim3 alignment."""
 import argparse
+import csv
 import json
 from pathlib import Path
 import sys
@@ -11,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from eval.pi3_adapter import load_pi3_model
 from eval.datasets_preprocess.movingdrone import find_scenes, group_scenes, load_frames, result_dir
+from loger.utils.satellite import SatelliteTileManager
+from tools.visualize_sca import dop_image, overlay
 from eval.uav_satelitte.plot_results import (
     plot_ablation,
     plot_counts,
@@ -27,6 +30,64 @@ def sim3(src, dst):
     return scale, r, b - scale * r @ a
 
 
+def run_sca_ablation(args, names):
+    from matplotlib import pyplot as plt
+    from torch.utils.tensorboard import SummaryWriter
+
+    model, _ = load_pi3_model(str(ROOT / 'ckpts/LoGeR/latest.pt'),
+                              str(ROOT / 'ckpts/LoGeR/original_config.yaml'),
+                              torch.device(args.gpu), sca_enabled=True)
+    weights = torch.load(args.sca_weights, map_location='cpu', weights_only=True)
+    model.sca.load_state_dict(weights)
+    manifest = json.loads(args.dop_manifest.read_text())
+    writer = SummaryWriter(str(args.output / 'tensorboard'))
+    summary = {}
+    for name in names:
+        images, gt, ids = load_frames(args.scenes / name, args.frames)
+        results = {}
+        for method in ('E0', 'E1', 'E2'):
+            model.sca_enabled = method != 'E0'
+            features = None
+            if method != 'E0':
+                with SatelliteTileManager(manifest[name]['correct' if method == 'E1' else 'wrong']) as manager:
+                    tiles = manager.get_all_tiles()
+                with torch.inference_mode():
+                    features = model.encode_satellite(tiles)
+            with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
+                pred = model(images[None], satellite_features=features, window_size=8,
+                             overlap_size=2, num_iterations=1, sim3=True)
+            poses = pred['camera_poses'][0].float().cpu().numpy()
+            centers = poses[:, :3, 3].astype(np.float64)
+            scale, rotation, translation = sim3(centers, gt)
+            aligned = scale * (centers @ rotation.T) + translation
+            errors = np.linalg.norm(aligned - gt, axis=1)
+            relative = np.linalg.norm(np.diff(aligned, axis=0) - np.diff(gt, axis=0), axis=1)
+            results[method] = {'ATE': float(np.sqrt(np.mean(errors ** 2))),
+                               'RPE': float(np.sqrt(np.mean(relative ** 2))),
+                               'aligned': aligned.tolist()}
+            writer.add_scalar(f'{name}/ATE/{method}', results[method]['ATE'], args.frames)
+            writer.add_scalar(f'{name}/RPE/{method}', results[method]['RPE'], args.frames)
+            if method == 'E1':
+                dop, size = dop_image(manifest[name]['correct'])
+                attention = pred['satellite_attention']['frame'][0, 0].float().cpu().numpy()
+                coords = features['pool_map_coords'][0].cpu().numpy()
+                writer.add_image(f'{name}/satellite_attention',
+                                 overlay(dop, size, attention, coords), args.frames, dataformats='HWC')
+        figure, axis = plt.subplots()
+        axis.plot(gt[:, 0], gt[:, 1], label='GT')
+        for method in ('E0', 'E1', 'E2'):
+            aligned = np.asarray(results[method]['aligned'])
+            axis.plot(aligned[:, 0], aligned[:, 1], label=method)
+        axis.legend()
+        axis.set_aspect('equal')
+        writer.add_figure(f'{name}/trajectory', figure, args.frames)
+        plt.close(figure)
+        summary[name] = results
+    writer.close()
+    args.output.mkdir(parents=True, exist_ok=True)
+    (args.output / 'sca_ablation.json').write_text(json.dumps(summary, indent=2))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--scenes', type=Path, default=ROOT.parent / 'MovingDrone_20/scenes')
@@ -34,9 +95,14 @@ def main():
     p.add_argument('--output', type=Path, default=Path(__file__).resolve().parent / 'results')
     p.add_argument('--frames', type=int, default=16, choices=(16, 64))
     p.add_argument('--gpu', default='cuda:0')
+    p.add_argument('--sca-weights', type=Path)
+    p.add_argument('--dop-manifest', type=Path, help='JSON: scene name -> correct/wrong GeoTIFF paths')
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     names = args.names or find_scenes(args.scenes)
+    if args.sca_weights:
+        run_sca_ablation(args, names)
+        return
     model, _ = load_pi3_model(str(ROOT / 'ckpts/LoGeR/latest.pt'), str(ROOT / 'ckpts/LoGeR/original_config.yaml'), torch.device(args.gpu))
     summary_file = args.output / 'summary.json'
     summary = json.loads(summary_file.read_text()) if summary_file.exists() else {}
