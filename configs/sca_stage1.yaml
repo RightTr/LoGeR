@@ -1,19 +1,13 @@
 model_config: ckpts/LoGeR/original_config.yaml
 weights: ckpts/LoGeR/latest.pt
-log_dir: runs/pyramid_attention
+log_dir: runs/sca_stage1
 epochs: 10
 learning_rate: 0.0001
-window_size: 4
-overlap_size: 2
-sigma_px: 32
-image_every_steps: 100
+window_size: 8
+chunk_weight: 0.5
 train:
   - scene: /path/to/train/scene
     dop: /path/to/train/dop.tif
-    labels: /path/to/train/labels.csv
-    center: [1305, 1075]
 val:
   - scene: /path/to/val/scene
     dop: /path/to/val/dop.tif
-    labels: /path/to/val/labels.csv
-    center: [1305, 1075]
