@@ -9,7 +9,9 @@ from ..utils.geometry import homogenize_points, robust_scale_estimation
 from .layers.pos_embed import RoPE2D, PositionGetter
 from .layers.block import BlockRope
 from .layers.swa import SWA
-from .layers.sca import SCA
+from .layers.roma_adapter import RoMaGeometryAdapter
+from .roma import RoMaCoarseEncoder
+from .roma.checkpoint import load_coarse_weights
 from .layers.transformer_head import TransformerDecoder, LinearPts3d, ContextOnlyTransformerDecoder
 from .layers.camera_head import CameraHead
 from .layers.conv_head import ConvHead
@@ -34,7 +36,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             ttt_pre_norm: bool = False,
             pi3x: bool = False,
             pi3x_metric: bool = True,
-            sca_enabled: bool = False,
+            roma_enabled: bool = False,
+            roma_checkpoint: Optional[str] = None,
+            roma_encode_batch_size: int = 8,
         ):
         super().__init__()
 
@@ -122,6 +126,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 rope=self.rope
             ) for _ in range(dec_depth)])
         self.dec_embed_dim = dec_embed_dim
+        self.roma_enabled = bool(roma_enabled)
+        self.roma_encode_batch_size = int(roma_encode_batch_size)
+        if self.roma_enabled:
+            self.roma_encoder = RoMaCoarseEncoder()
+            load_coarse_weights(self.roma_encoder, roma_checkpoint)
+            self.roma_adapter = RoMaGeometryAdapter()
 
         # ----------------------
         #     Register_token
@@ -259,59 +269,43 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             insert_after=self.attn_insert_after,
             rope=self.rope,
         )
-        self.sca_enabled = bool(sca_enabled)
-        self.sca = None
-        if self.sca_enabled:
-            satellite_dim = self.satellite_encoder.backbone.embed_dim
-            self.sca = SCA(
-                uav_dim=self.dec_embed_dim,
-                satellite_dim=satellite_dim,
-                attn_dim=256,
-            )
+        if self.roma_enabled:
             for name, parameter in self.named_parameters():
-                parameter.requires_grad_(name.startswith("sca."))
+                parameter.requires_grad_(name.startswith("roma_adapter."))
+            self.roma_encoder.eval()
 
-    def encode_satellite(self, satellite_tiles):
-        """Encode satellite tiles once for reuse across UAV chunks."""
-        tiles = satellite_tiles["tiles"]
-        coords = satellite_tiles["pool_map_coords"]
-        mask = satellite_tiles["pool_valid_mask"]
+    def train(self, mode=True):
+        super().train(mode)
+        if self.roma_enabled:
+            self.uav_encoder.eval()
+            self.satellite_encoder.eval()
+            self.roma_encoder.eval()
+        return self
+
+    def encode_roma_satellite(self, tiles):
+        """Encode normalized [B, T, 3, H, W] tiles once for repeated use."""
         if tiles.ndim == 4:
             tiles = tiles.unsqueeze(0)
-            coords = coords.unsqueeze(0)
-            mask = mask.unsqueeze(0)
-        batch, tile_count = tiles.shape[:2]
+        batch, tile_count, _, height, width = tiles.shape
         flat = tiles.flatten(0, 1)
-        pooled = torch.cat([self.satellite_encoder(tile)["pool_tokens"]
-                            for tile in flat.split(2)], dim=0)
-        return {
-            "pool_tokens": pooled.reshape(batch, tile_count * pooled.shape[1], -1),
-            "pool_map_coords": coords.flatten(1, 2),
-            "pool_valid_mask": mask.flatten(1, 2),
-            "tile_origins": satellite_tiles["tile_origins"],
-            "dop_size": satellite_tiles["dop_size"],
-        }
+        tokens = torch.cat([self.satellite_encoder(part)["patch_tokens"]
+                            for part in flat.split(self.roma_encode_batch_size)], dim=0)
+        return {"patch_tokens": tokens.reshape(batch, tile_count, tokens.shape[1], -1),
+                "grid_size": (height // 14, width // 14)}
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         """Load checkpoints using UAVEncoder's key compatibility mapping."""
         remapped = SWA.remap_state_dict(UAVEncoder.remap_state_dict(state_dict))
-        if any(key in remapped for key in ("sca.lambda_mid", "sca.film.0.weight", "sca.log_temperature")):
-            for key in list(remapped):
-                if key.startswith("sca."):
-                    del remapped[key]
-        if self.sca is not None:
-            current = self.state_dict()
-            for key in list(remapped):
-                if key.startswith("sca.") and (key not in current or remapped[key].shape != current[key].shape):
-                    del remapped[key]
         for key in list(remapped):
             if (key.startswith("satellite_encoder.projection.") or
-                    key.startswith("pyramid_attention.") or
-                    (self.sca is None and key.startswith("sca."))):
+                    key.startswith("pyramid_attention.")):
                 del remapped[key]
         incompatible = super().load_state_dict(remapped, strict=False, assign=assign)
         if strict:
-            allowed = ("satellite_encoder.", "sca.")
+            allowed = ("satellite_encoder.",)
+            for prefix in ("roma_encoder.", "roma_adapter."):
+                if not any(key.startswith(prefix) for key in remapped):
+                    allowed += (prefix,)
             missing = [key for key in incompatible.missing_keys if not key.startswith(allowed)]
             unexpected = incompatible.unexpected_keys
             if missing or unexpected:
@@ -366,7 +360,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         self._initialize_ttt_layers_from_global(self.swa.layers, "swa", self.attn_insert_after)
 
     def decode(self, hidden, N, H, W, ttt_dict: Optional[dict] = None, window_size: Optional[int] = None, overlap_size: Optional[int] = None, is_first_window: bool = False,
-               turn_off_ttt=False, turn_off_swa=False, satellite_memory=None) -> torch.Tensor:
+               turn_off_ttt=False, turn_off_swa=False, roma_tokens=None) -> torch.Tensor:
         BN, hw, _ = hidden.shape
         B = BN // N
 
@@ -406,7 +400,6 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             pos = torch.cat([pos_special, pos], dim=1)
        
         ttt_output_info = None
-        satellite_maps = None
         ttt_state = ttt_dict.get("ttt") if ttt_dict is not None else None
         attn_state = ttt_dict.get("attn") if ttt_dict is not None else None
         gate_scales: List[torch.Tensor] = []
@@ -487,11 +480,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             if attn_state is not None and i in attn_state.get("insert_after", []):
                 insert_after_list = attn_state.get("insert_after", [])
                 layer_idx = insert_after_list.index(i)
-                if i == min(insert_after_list) and satellite_memory is not None:
-                    hidden, satellite_maps = self.sca(
-                        hidden.reshape(B * N, hw, -1), B, N, self.patch_start_idx,
-                        (H // self.patch_size, W // self.patch_size), satellite_memory,
-                    )
+                if i == min(insert_after_list) and roma_tokens is not None:
+                    hidden = self.roma_adapter(hidden.reshape(B * N, hw, -1),
+                                               roma_tokens, self.patch_start_idx)
                 history_list = attn_state.get("history", [None] * len(insert_after_list))
                 history = history_list[layer_idx]
                 x_for_residual = hidden.view(B, N, hw, -1)
@@ -539,13 +530,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             avg_gate_scale,
             avg_attn_gate_scale,
             gate_scales,
-            satellite_maps,
         )
     
     def forward(self, imgs, *args, **kwargs):
         # Windowing controls (optional)
-        satellite_tiles = kwargs.pop("satellite_tiles", None)
-        satellite_features = kwargs.pop("satellite_features", None)
+        roma_satellite_features = kwargs.pop("roma_satellite_features", None)
+        roma_tile_indices = kwargs.pop("roma_tile_indices", None)
         window_size = kwargs.pop('window_size', -1)
         overlap_size = kwargs.pop('overlap_size', 1)
         num_iterations = kwargs.pop('num_iterations', 1)
@@ -584,18 +574,21 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         B, N, C, H, W = imgs.shape
         patch_h, patch_w = H // 14, W // 14
 
-        satellite_memory = None
-        if self.sca_enabled:
-            satellite_features = (
-                self.encode_satellite(satellite_tiles)
-                if satellite_tiles is not None else satellite_features
-            )
-            satellite_memory = {
-                "tokens": satellite_features["pool_tokens"].to(self.image_mean.device),
-                "mask": satellite_features["pool_valid_mask"].to(self.image_mean.device),
-                "coords": satellite_features["pool_map_coords"].to(self.image_mean.device),
-                "dop_size": satellite_features["dop_size"].to(self.image_mean.device),
-            }
+        cached_uav = None
+        if self.roma_enabled:
+            tiles = roma_satellite_features["patch_tokens"].to(self.image_mean.device)
+            tile_grid = tuple(roma_satellite_features["grid_size"])
+            tile_indices = roma_tile_indices.to(device=tiles.device, dtype=torch.long)
+            # Encode each frame exactly once, including overlapping windows.
+            flat = imgs.reshape(B * N, C, H, W)
+            chunks = []
+            with torch.no_grad():
+                for part in flat.split(self.roma_encode_batch_size):
+                    part = part.to(self.image_mean.device)
+                    part = (part - self.image_mean) / self.image_std
+                    encoded = self.uav_encoder(part, is_training=True)
+                    chunks.append(encoded["x_norm_patchtokens"] if isinstance(encoded, dict) else encoded)
+            cached_uav = torch.cat(chunks, dim=0).reshape(B, N, -1, 1024)
 
         # --- Unified Windowed Inference ---
         if window_size <= 0 or window_size >= N:
@@ -640,7 +633,6 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         all_predictions = []
         all_gate_scales: List[torch.Tensor] = []
         all_attn_gate_scales: List[torch.Tensor] = []
-        all_satellite_maps = []
         
         windows_iter = windows
         for window_idx, (start_idx, end_idx) in enumerate(windows_iter):
@@ -650,6 +642,15 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             imgs_w = imgs_w.to(self.image_mean.device)
             imgs_w = (imgs_w - self.image_mean) / self.image_std
             Nw = imgs_w.shape[1]
+            roma_tokens = None
+            if cached_uav is not None:
+                uav_features = cached_uav[:, start_idx:end_idx].reshape(B * Nw, -1, 1024)
+                selected = tiles[torch.arange(B, device=tiles.device)[:, None],
+                                 tile_indices[:, start_idx:end_idx]]
+                satellite_tokens = selected.reshape(B * Nw, selected.shape[-2], selected.shape[-1])
+                roma_tokens = self.roma_encoder.forward_from_features(
+                    uav_features.detach(), satellite_tokens.detach(), (patch_h, patch_w), tile_grid
+                )["coarse_tokens"]
 
             # Initialize to satisfy static analyzers; will be set inside decode loop
             hidden = None  # type: ignore[assignment]
@@ -664,10 +665,13 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 if self.swa.layers and swa_history is None:
                     swa_history = [None] * len(self.attn_insert_after)
 
-                imgs_flat = imgs_w.reshape(B * Nw, C, H, W)
-                hidden_input = self.uav_encoder(imgs_flat, is_training=True)
-                if isinstance(hidden_input, dict):
-                    hidden_input = hidden_input["x_norm_patchtokens"]
+                if cached_uav is None:
+                    imgs_flat = imgs_w.reshape(B * Nw, C, H, W)
+                    hidden_input = self.uav_encoder(imgs_flat, is_training=True)
+                    if isinstance(hidden_input, dict):
+                        hidden_input = hidden_input["x_norm_patchtokens"]
+                else:
+                    hidden_input = uav_features
 
                 # Prepare adapter control dictionaries for decode
                 ttt_state = None
@@ -695,7 +699,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "ttt": ttt_state,
                         "attn": attn_state,
                     }
-                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, satellite_maps = self.decode(
+                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales = self.decode(
                     hidden_input, Nw, H, W,
                     ttt_dict=ttt_dict,
                     window_size=window_size,
@@ -703,7 +707,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     is_first_window=(start_idx == 0),
                     turn_off_ttt=turn_off_ttt,
                     turn_off_swa=turn_off_swa,
-                    satellite_memory=satellite_memory if iteration == num_iterations - 1 else None,
+                    roma_tokens=roma_tokens,
                 )
                 if decode_avg_gate_scale is not None:
                     all_gate_scales.append(decode_avg_gate_scale.detach().cpu())
@@ -721,9 +725,6 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             # If for some reason decoding didn't produce hidden (e.g., empty window), skip this window
             if hidden is None:
                 continue
-            if satellite_maps is not None:
-                all_satellite_maps.append(satellite_maps)
-
             point_hidden = self.point_decoder(hidden, xpos=pos)
             if self.use_conf and self.conf_decoder is not None:
                 conf_hidden = self.conf_decoder(hidden, xpos=pos)
@@ -829,13 +830,6 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
         if all_attn_gate_scales:
             merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
-        if all_satellite_maps:
-            merged["satellite_attention"] = {
-                "frame": torch.cat([maps["frame"][:, :-eff_overlap] if eff_overlap else maps["frame"]
-                                    for maps in all_satellite_maps[:-1]]
-                                   + [all_satellite_maps[-1]["frame"]], dim=1),
-            }
-            merged["satellite_attention"]["chunk"] = merged["satellite_attention"]["frame"].mean(dim=1)
         return merged
 
     def _merge_windowed_predictions(self, all_predictions, window_size, overlap_size):
