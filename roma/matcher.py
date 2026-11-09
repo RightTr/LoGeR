@@ -1,4 +1,29 @@
+"""MatchAnything RoMa coarse kernel and GP. See roma/UPSTREAM.txt.
+
+MIT License
+Copyright (c) 2023 Johan Edstedt
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
 import math
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,7 +50,6 @@ class CosKernel(nn.Module):  # similar to softmax kernel
         K = ((c - 1.0) / T).exp()
         return K
 
-
 class GP(nn.Module):
     def __init__(
         self,
@@ -39,7 +63,7 @@ class GP(nn.Module):
         only_nearest_neighbour=False,
         sigma_noise=0.1,
         no_cov=False,
-        predict_features=False,
+        predict_features = False,
     ):
         super().__init__()
         self.K = kernel(T=T, learn_temperature=learn_temperature)
@@ -60,17 +84,13 @@ class GP(nn.Module):
         cov = F.pad(cov, 4 * (K // 2,))  # pad v_q
         delta = torch.stack(
             torch.meshgrid(
-                torch.arange(-(K // 2), K // 2 + 1),
-                torch.arange(-(K // 2), K // 2 + 1),
-                indexing="ij",
+                torch.arange(-(K // 2), K // 2 + 1), torch.arange(-(K // 2), K // 2 + 1)
             ),
             dim=-1,
         )
         positions = torch.stack(
             torch.meshgrid(
-                torch.arange(K // 2, h + K // 2),
-                torch.arange(K // 2, w + K // 2),
-                indexing="ij",
+                torch.arange(K // 2, h + K // 2), torch.arange(K // 2, w + K // 2)
             ),
             dim=-1,
         )
@@ -103,8 +123,7 @@ class GP(nn.Module):
             (
                 torch.linspace(-1 + 1 / h, 1 - 1 / h, h, device=y.device),
                 torch.linspace(-1 + 1 / w, 1 - 1 / w, w, device=y.device),
-            ),
-            indexing="ij",
+            )
         )
 
         coarse_coords = torch.stack((coarse_coords[1], coarse_coords[0]), dim=-1)[
@@ -120,32 +139,27 @@ class GP(nn.Module):
         f = self.get_pos_enc(y)
         b, d, h2, w2 = f.shape
         x, y, f = self.reshape(x.float()), self.reshape(y.float()), self.reshape(f)
-        # K_xx = self.K(x, x)
+        K_xx = self.K(x, x)
         K_yy = self.K(y, y)
         K_xy = self.K(x, y)
         K_yx = K_xy.permute(0, 2, 1)
         sigma_noise = self.sigma_noise * torch.eye(h2 * w2, device=x.device)[None, :, :]
-        if self.training:
-            K_yy_inv = torch.linalg.inv(K_yy + sigma_noise)
-            mu_x = K_xy.matmul(K_yy_inv.matmul(f))
-        else:
-            # faster inference, possibly also useful for training
-            L_t = torch.linalg.cholesky(K_yy + sigma_noise)
-            pos_emb = torch.cholesky_solve(f.reshape(b, h2 * w2, d), L_t, upper=False)
-            mu_x = K_xy @ pos_emb
+        with warnings.catch_warnings():
+            K_yy = K_yy + sigma_noise # To increase stability in inverse
+            with torch.no_grad():
+                K_yy_dig_zeromask = ((K_yy[torch.eye(h2 * w2, device=x.device, dtype=torch.bool).repeat(b, 1, 1)] == 0).reshape(b, -1))
+            K_yy = K_yy + self.sigma_noise * K_yy_dig_zeromask[..., None] * torch.eye(h2 * w2, device=x.device)[None, :, :]
+            K_yy_inv = torch.linalg.inv(K_yy)
+
+        mu_x = K_xy.matmul(K_yy_inv.matmul(f))
         mu_x = rearrange(mu_x, "b (h w) d -> b d h w", h=h1, w=w1)
-
-
-        # if not self.no_cov:
-        #     cov_x = K_xx - K_xy.matmul(K_yy_inv.matmul(K_yx))
-        #     cov_x = rearrange(
-        #         cov_x, "b (h w) (r c) -> b h w r c", h=h1, w=w1, r=h1, c=w1
-        #     )
-        #     local_cov_x = self.get_local_cov(cov_x)
-        #     local_cov_x = rearrange(local_cov_x, "b h w K -> b K h w")
-        #     gp_feats = torch.cat((mu_x, local_cov_x), dim=1)
-        # else:
-        gp_feats = mu_x
+        if not self.no_cov:
+            cov_x = K_xx - K_xy.matmul(K_yy_inv.matmul(K_yx))
+            cov_x = rearrange(cov_x, "b (h w) (r c) -> b h w r c", h=h1, w=w1, r=h1, c=w1)
+            local_cov_x = self.get_local_cov(cov_x)
+            local_cov_x = rearrange(local_cov_x, "b h w K -> b K h w")
+            gp_feats = torch.cat((mu_x, local_cov_x), dim=1)
+        else:
+            gp_feats = mu_x
         return gp_feats
-
 
