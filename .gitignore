@@ -2,6 +2,7 @@ __pycache__/
 results*/
 convert_ckpt_to_params.py
 *.pt
+/ckpts/MatchAnything/
 /wandb/
 /runs/
 /outputs/

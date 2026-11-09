@@ -13,8 +13,12 @@ from .transformer import TransformerDecoder
 def _load(path):
     if Path(path).suffix == ".safetensors":
         from safetensors.torch import load_file
-        return load_file(str(path), device="cpu")
-    return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        weights = load_file(str(path), device="cpu")
+    else:
+        weights = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    if "state_dict" in weights and isinstance(weights["state_dict"], dict):
+        weights = weights["state_dict"]
+    return weights
 
 
 def _load_prefix(module, weights, prefix):
@@ -76,15 +80,24 @@ class RoMaCoarseMatcher(nn.Module):
         f2_s = target_features
         with torch.autocast(device_type=image_a.device.type, enabled=False):
             gp_posterior = self.gp(f1_s, f2_s)
-            logits, certainty = self.embedding_decoder(gp_posterior, f1_s)
+            logits, no_match = self.embedding_decoder(gp_posterior, f1_s)
         batch, _, height, width = logits.shape
         logits = logits.flatten(2).transpose(1, 2)
-        certainty = certainty.flatten(2).transpose(1, 2).squeeze(-1)
+        no_match_logits = no_match.flatten(2).transpose(1, 2).squeeze(-1)
+        all_logits = torch.cat((logits, no_match_logits[..., None]), dim=-1).float()
+        all_probability = all_logits.softmax(dim=-1)
+        match_probability = all_probability[..., :-1].sum(dim=-1)
+        no_match_probability = all_probability[..., -1]
         return {
             "match_logits": logits,
             "match_prob": logits.softmax(dim=-1),
-            "certainty_logits": certainty,
-            "certainty": certainty.sigmoid(),
+            "no_match_logits": no_match_logits,
+            "match_probability": match_probability,
+            "no_match_probability": no_match_probability,
+            # Backwards-compatible name: the 4097th class is no-match, so
+            # matchability is its complement, not sigmoid(no_match_logit).
+            "certainty_logits": torch.logsumexp(logits.float(), dim=-1) - no_match_logits.float(),
+            "certainty": match_probability,
             "gp_posterior": gp_posterior,
             "grid_size": (height, width),
             "target_size": tuple(target_size),

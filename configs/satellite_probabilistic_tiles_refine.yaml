@@ -1,0 +1,25 @@
+dataset_root: /mnt/Data/RIght/MovingDrone_Tiles
+satellite_image: dop_view.jpg
+model_config: ckpts/LoGeR/original_config.yaml
+loger_checkpoint: ckpts/LoGeR/latest.pt
+matchanything_checkpoint: ckpts/MatchAnything/matchanything_roma.ckpt
+roma_dino_checkpoint: /home/pi/.cache/torch/hub/checkpoints/dinov2_vitl14_pretrain.pth
+device: cuda:1
+seed: 42
+split_file: runs/satellite_memory_tiles_dop_view_1h/split.json
+image_size: [252, 448]
+sample_stride: 10
+window_size: 6
+overlap_size: 2
+single_steps: 500
+two_chunk_steps: 0
+validate_every: 50
+val_steps: 6
+final_loss_windows: 12
+probabilistic_topk: 8
+probabilistic_lr: 0.00002
+weight_decay: 0.01
+lambda_global: 0.5
+lambda_rotation: 0.1
+lambda_translation: 10.0
+output: runs/probabilistic_satellite_tiles_refine

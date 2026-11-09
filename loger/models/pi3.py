@@ -12,8 +12,7 @@ from .layers.block import BlockRope
 from .layers.attention import FlashAttentionRope
 from .layers.swa import SWA
 from .layers.roma_association import RoMaAssociation
-from .layers.satellite_bidirectional import SatelliteBidirectional
-from .layers.satellite_memory import SatelliteMemory
+from .layers.satellite_probabilistic_fusion import SatelliteProbabilisticFusion
 from roma import RoMaCoarseMatcher
 from .layers.transformer_head import TransformerDecoder, LinearPts3d, ContextOnlyTransformerDecoder
 from .layers.camera_head import CameraHead
@@ -43,6 +42,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             roma_checkpoint: Optional[str] = None,
             roma_dino_checkpoint: Optional[str] = None,
             roma_encode_batch_size: int = 8,
+            roma_gradient_checkpointing: bool = False,
+            roma_probabilistic_topk: int = 8,
         ):
         super().__init__()
 
@@ -132,14 +133,15 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         self.dec_embed_dim = dec_embed_dim
         self.roma_enabled = bool(roma_enabled)
         self.roma_encode_batch_size = int(roma_encode_batch_size)
+        self.roma_gradient_checkpointing = bool(roma_gradient_checkpointing)
         if self.roma_enabled:
             assert self.attn_insert_after and 0 <= min(self.attn_insert_after) < len(self.decoder), \
                 "RoMa fusion requires a valid SWA insertion position"
             self.roma_fusion_after = min(self.attn_insert_after)
             self.roma_matcher = RoMaCoarseMatcher(roma_dino_checkpoint, roma_checkpoint)
             self.roma_association = RoMaAssociation()
-            self.satellite_bidirectional = SatelliteBidirectional(hidden_dim=dec_embed_dim)
-            self.satellite_memory = SatelliteMemory()
+            self.satellite_probabilistic = SatelliteProbabilisticFusion(
+                hidden_dim=dec_embed_dim, topk=roma_probabilistic_topk)
 
         # ----------------------
         #     Register_token
@@ -279,7 +281,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         )
         if self.roma_enabled:
             for name, parameter in self.named_parameters():
-                parameter.requires_grad_(name.startswith(("satellite_bidirectional.", "satellite_memory.")))
+                parameter.requires_grad_(name.startswith("satellite_probabilistic."))
             self.roma_matcher.eval()
 
     def train(self, mode=True):
@@ -302,29 +304,36 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 "grid_size": (height // 14, width // 14)}
 
     @torch.no_grad()
-    def _roma_prior(self, imgs, tile_image, uav_grid):
+    def _roma_prior(self, imgs, tile_image, uav_grid, target_features=None):
         """Match every UAV frame while encoding the fixed target Tile once."""
         batch, frames, _, _, _ = imgs.shape
         tile_image = tile_image.to(self.image_mean.device)
-        target = self.roma_matcher.encode_target((tile_image - self.image_mean) / self.image_std)
-        priors, reliabilities = [], []
+        target = target_features
+        if target is None:
+            target = self.roma_matcher.encode_target(
+                (tile_image - self.image_mean) / self.image_std)
+        priors, match_probabilities, spatial_certainties = [], [], []
         for b in range(batch):
-            frame_priors, frame_reliabilities = [], []
+            frame_priors = []
+            frame_match_probabilities, frame_spatial_certainties = [], []
             for n in range(frames):
                 image = imgs[b, n:n + 1].to(self.image_mean.device)
                 image = (image - self.image_mean) / self.image_std
                 match = self.roma_matcher.match_with_target(
                     image, target[b:b + 1], tile_image.shape[-2:])
-                prior, reliability = self.roma_association(
-                    match["match_logits"][:, None], match["certainty"][:, None],
+                prior, _, match_probability, spatial_certainty = self.roma_association(
+                    match["match_logits"][:, None], match["no_match_logits"][:, None],
                     match["grid_size"], uav_grid)
                 frame_priors.append(prior)
-                frame_reliabilities.append(reliability)
+                frame_match_probabilities.append(match_probability.reshape(1, 1, -1))
+                frame_spatial_certainties.append(spatial_certainty)
             priors.append(torch.cat(frame_priors, dim=1))
-            reliabilities.append(torch.cat(frame_reliabilities, dim=1))
+            match_probabilities.append(torch.cat(frame_match_probabilities, dim=1))
+            spatial_certainties.append(torch.cat(frame_spatial_certainties, dim=1))
         patches = uav_grid[0] * uav_grid[1]
         return (torch.cat(priors, dim=0).reshape(batch, frames, patches, 256),
-                torch.cat(reliabilities, dim=0).reshape(batch, frames, patches))
+                torch.cat(match_probabilities, dim=0).reshape(batch, frames, patches),
+                torch.cat(spatial_certainties, dim=0).reshape(batch, frames, patches))
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         """Load checkpoints using UAVEncoder's key compatibility mapping."""
@@ -332,12 +341,13 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         for key in list(remapped):
             if (key.startswith("satellite_encoder.projection.") or
                     key.startswith("pyramid_attention.") or
-                    key.startswith(("roma_encoder.", "roma_adapter."))):
+                    key.startswith(("roma_encoder.", "roma_adapter.",
+                                    "satellite_bidirectional.", "satellite_memory."))):
                 del remapped[key]
         incompatible = super().load_state_dict(remapped, strict=False, assign=assign)
         if strict:
             allowed = ("satellite_encoder.",)
-            for prefix in ("roma_matcher.", "satellite_bidirectional.", "satellite_memory."):
+            for prefix in ("roma_matcher.", "satellite_probabilistic."):
                 if not any(key.startswith(prefix) for key in remapped):
                     allowed += (prefix,)
             missing = [key for key in incompatible.missing_keys if not key.startswith(allowed)]
@@ -399,6 +409,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         B = BN // N
 
         final_output = []
+        satellite_fusion_stats = None
         
         hidden = hidden.reshape(B*N, hw, -1)
 
@@ -470,7 +481,14 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             else:
                 hidden_before_block = hidden_for_block # dummy
 
-            hidden = blk(hidden_for_block, xpos=pos_for_block)
+            if (self.training and self.roma_gradient_checkpointing
+                    and hidden_for_block.requires_grad):
+                from torch.utils.checkpoint import checkpoint
+                hidden = checkpoint(
+                    lambda x, block=blk, xpos=pos_for_block: block(x, xpos=xpos), hidden_for_block,
+                    use_reentrant=False)
+            else:
+                hidden = blk(hidden_for_block, xpos=pos_for_block)
 
             if ttt_state is not None and i in ttt_state.get("insert_after", []):
                 # Help static analyzers: ensure non-None
@@ -493,7 +511,19 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     "w1": ttt_state["w1"][layer_idx],
                     "w2": ttt_state["w2"][layer_idx],
                 }
-                ttt_output, output = self.ttt_layers[layer_idx](tokens_in, info)
+                if (self.training and self.roma_gradient_checkpointing
+                        and tokens_in.requires_grad):
+                    from torch.utils.checkpoint import checkpoint
+
+                    def run_ttt(x, layer=self.ttt_layers[layer_idx], state=info):
+                        result, updated = layer(x, state)
+                        return result, updated["w0"], updated["w1"], updated["w2"]
+
+                    ttt_output, w0_new, w1_new, w2_new = checkpoint(
+                        run_ttt, tokens_in, use_reentrant=False)
+                    output = {"w0": w0_new, "w1": w1_new, "w2": w2_new}
+                else:
+                    ttt_output, output = self.ttt_layers[layer_idx](tokens_in, info)
                 
                 update_term = ttt_output * gate_scale
 
@@ -510,6 +540,22 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 ttt_output_info["w0"][layer_idx] = output["w0"]
                 ttt_output_info["w1"][layer_idx] = output["w1"]
                 ttt_output_info["w2"][layer_idx] = output["w2"]
+
+            # Satellite read/write updates the patch tokens before the first
+            # SWA, so SWA consumes and caches satellite-enhanced features.
+            if fusion is not None and i == self.roma_fusion_after:
+                hidden_by_frame = hidden.reshape(B, N, hw, -1)
+                patches = hidden_by_frame[:, :, self.patch_start_idx:]
+                delta, satellite_state, _, satellite_fusion_stats = self.satellite_probabilistic(
+                    patches, fusion["satellite_features"], fusion["tile_bbox"],
+                    fusion["memory"], fusion["prior"], fusion["reliability"],
+                    fusion["match_probability"], frame_mask=fusion["new_frame_mask"],
+                    use_memory=fusion["use_memory"])
+                hidden_by_frame = torch.cat((
+                    hidden_by_frame[:, :, :self.patch_start_idx],
+                    patches + delta.to(patches.dtype)), dim=2)
+                hidden = (hidden_by_frame.reshape(B * N, hw, -1) if i % 2 == 0
+                          else hidden_by_frame.reshape(B, N * hw, -1))
 
             # Sliding Window Attention (SWA)
             if attn_state is not None and i in attn_state.get("insert_after", []):
@@ -535,17 +581,6 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     ttt_output_info["history"] = [None] * len(insert_after_list)
                 ttt_output_info["history"][layer_idx] = new_history
                 hidden = x_out_patch.reshape(B * N, hw, -1)
-
-                if fusion is not None and i == self.roma_fusion_after:
-                    patches = hidden.reshape(B, N, hw, -1)[:, :, self.patch_start_idx:]
-                    delta, satellite_state = self.satellite_bidirectional(
-                        patches, fusion["uav_features"], fusion["satellite_features"],
-                        fusion["tile_bbox"], fusion["memory"], fusion["prior"],
-                        fusion["reliability"])
-                    hidden = hidden.reshape(B, N, hw, -1)
-                    hidden = torch.cat((hidden[:, :, :self.patch_start_idx],
-                                        patches + delta.to(patches.dtype)), dim=2)
-                    hidden = hidden.reshape(B * N, hw, -1)
 
             if i+1 in [len(self.decoder)-1, len(self.decoder)]:
                 final_output.append(hidden.reshape(B*N, hw, -1))
@@ -574,6 +609,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             avg_attn_gate_scale,
             gate_scales,
             satellite_state,
+            satellite_fusion_stats,
         )
     
     def forward(self, imgs, *args, **kwargs):
@@ -583,6 +619,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         roma_tile_bbox = kwargs.pop("roma_tile_bbox", None)
         roma_tile_id = kwargs.pop("roma_tile_id", None)
         roma_memory = kwargs.pop("roma_memory", None)
+        roma_new_frame_mask = kwargs.pop("roma_new_frame_mask", None)
+        roma_match_target_features = kwargs.pop("roma_match_target_features", None)
+        roma_memory_mode = kwargs.pop("roma_memory_mode", "recurrent")
         window_size = kwargs.pop('window_size', -1)
         overlap_size = kwargs.pop('overlap_size', 1)
         num_iterations = kwargs.pop('num_iterations', 1)
@@ -596,6 +635,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
         if sim3 and se3:
             raise ValueError("'sim3' and 'se3' alignments are mutually exclusive; enable only one.")
+        if roma_memory_mode not in ("recurrent", "reset", "shuffle"):
+            if roma_memory_mode != "off":
+                raise ValueError("roma_memory_mode must be off, recurrent, reset, or shuffle")
 
         # Ensure at least one decode iteration so that 'hidden' is always defined
         try:
@@ -622,7 +664,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         patch_h, patch_w = H // 14, W // 14
 
         cached_uav = None
-        if self.roma_enabled:
+        roma_active = self.roma_enabled and roma_memory_mode != "off"
+        if roma_active:
             if roma_satellite_features is None:
                 roma_satellite_features = self.encode_roma_satellite(roma_tile_image)
             tiles = roma_satellite_features["patch_tokens"].to(self.image_mean.device)
@@ -637,9 +680,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                                            rtol=0, atol=1e-6)
                 if not (same_id and same_bbox):
                     raise ValueError("Satellite Memory belongs to another Tile; reset roma_memory")
-            prior_all, reliability_all = self._roma_prior(imgs, roma_tile_image, (patch_h, patch_w))
-            memory = (torch.zeros(B, 256, 256, device=tiles.device, dtype=satellite_features.dtype)
-                      if roma_memory is None else roma_memory["features"].to(tiles.device))
+            prior_all, match_probability_all, spatial_certainty_all = self._roma_prior(
+                imgs, roma_tile_image, (patch_h, patch_w), roma_match_target_features)
+            memory = None if roma_memory is None else roma_memory["features"].to(tiles.device)
             # Encode each frame exactly once, including overlapping windows.
             flat = imgs.reshape(B * N, C, H, W)
             chunks = []
@@ -695,6 +738,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         all_gate_scales: List[torch.Tensor] = []
         all_attn_gate_scales: List[torch.Tensor] = []
         previous_window_end = 0
+        memory_update_norms = []
+        memory_coverages = []
+        fusion_stat_history = []
         
         windows_iter = windows
         for window_idx, (start_idx, end_idx) in enumerate(windows_iter):
@@ -708,18 +754,30 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             if cached_uav is not None:
                 uav_features = cached_uav[:, start_idx:end_idx].reshape(B * Nw, -1, 1024)
                 fusion = {
-                    "uav_features": uav_features.reshape(B, Nw, patch_h * patch_w, 1024),
                     "satellite_features": satellite_features,
                     "tile_bbox": tile_bbox,
-                    "memory": memory,
+                    "memory": (None if roma_memory_mode == "reset" else
+                               memory.roll(1, dims=1) if roma_memory_mode == "shuffle"
+                               and window_idx > 0 and memory is not None else memory),
                     "prior": prior_all[:, start_idx:end_idx].reshape(B, Nw * patch_h * patch_w, 256),
-                    "reliability": reliability_all[:, start_idx:end_idx].reshape(B, Nw * patch_h * patch_w),
+                    "reliability": spatial_certainty_all[:, start_idx:end_idx].reshape(
+                        B, Nw * patch_h * patch_w),
+                    "match_probability": match_probability_all[:, start_idx:end_idx].reshape(
+                        B, Nw * patch_h * patch_w),
+                    "use_memory": roma_memory_mode not in ("off", "reset"),
+                    "new_frame_mask": (
+                        roma_new_frame_mask[:, start_idx:end_idx].to(self.image_mean.device)
+                        if roma_new_frame_mask is not None else
+                        (torch.arange(start_idx, end_idx, device=self.image_mean.device)
+                         >= previous_window_end)[None].expand(B, -1)
+                    ),
                 }
 
             # Initialize to satisfy static analyzers; will be set inside decode loop
             hidden = None  # type: ignore[assignment]
             pos = None     # type: ignore[assignment]
             satellite_state = None
+            satellite_fusion_stats = None
 
             for iteration in range(num_iterations):
                 if self.ttt_layers is not None and w0 is None:
@@ -764,7 +822,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "ttt": ttt_state,
                         "attn": attn_state,
                     }
-                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, satellite_state = self.decode(
+                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, satellite_state, satellite_fusion_stats = self.decode(
                     hidden_input, Nw, H, W,
                     ttt_dict=ttt_dict,
                     window_size=window_size,
@@ -774,6 +832,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     turn_off_swa=turn_off_swa,
                     fusion=fusion,
                 )
+                if satellite_fusion_stats is not None:
+                    fusion_stat_history.append(satellite_fusion_stats)
                 if decode_avg_gate_scale is not None:
                     all_gate_scales.append(decode_avg_gate_scale.detach().cpu())
                 if decode_avg_attn_gate_scale is not None:
@@ -788,10 +848,14 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     swa_history = ttt_output_info.get("history", swa_history)
 
             if fusion is not None:
-                frame_ids = torch.arange(start_idx, end_idx, device=memory.device)
-                new_frame_mask = (frame_ids >= previous_window_end)[None].expand(B, -1)
-                memory = self.satellite_memory(memory, satellite_state, fusion["prior"],
-                                               fusion["reliability"], new_frame_mask)
+                old_memory = memory
+                memory = satellite_state
+                if old_memory is not None:
+                    memory_update_norms.append((memory - old_memory).float().norm(dim=-1).mean())
+                if satellite_fusion_stats is not None:
+                    if old_memory is None:
+                        memory_update_norms.append(satellite_fusion_stats["memory_update_norm"])
+                    memory_coverages.append(satellite_fusion_stats["coverage"])
                 previous_window_end = end_idx
 
             # If for some reason decoding didn't produce hidden (e.g., empty window), skip this window
@@ -902,13 +966,29 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
         if all_attn_gate_scales:
             merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
-        if self.roma_enabled:
+        if roma_active:
             keep_device = self.training or no_detach
             merged["satellite_memory"] = {
                 "features": memory if keep_device else memory.detach().cpu(),
                 "tile_id": tile_id.detach() if keep_device else tile_id.detach().cpu(),
                 "tile_bbox": tile_bbox.detach() if keep_device else tile_bbox.detach().cpu(),
             }
+            merged["roma_certainty"] = spatial_certainty_all.mean().detach()
+            merged["roma_match_probability"] = match_probability_all.mean().detach()
+            merged["roma_no_match_probability"] = (1.0 - match_probability_all).mean().detach()
+            merged["roma_spatial_certainty"] = spatial_certainty_all.mean().detach()
+            reliable = (match_probability_all >= 0.5) & (spatial_certainty_all >= 0.5)
+            merged["roma_reliable_patch_fraction"] = reliable.float().mean().detach()
+            merged["satellite_memory_update_norm"] = (
+                torch.stack(memory_update_norms).mean() if memory_update_norms
+                else memory.new_zeros(())).detach()
+            merged["satellite_memory_coverage"] = (
+                torch.stack(memory_coverages).mean() if memory_coverages
+                else memory.new_zeros(())).detach()
+            if fusion_stat_history:
+                for key in fusion_stat_history[0]:
+                    merged[f"satellite_probabilistic_{key}"] = torch.stack(
+                        [stats[key].detach() for stats in fusion_stat_history]).mean()
         return merged
 
     def _merge_windowed_predictions(self, all_predictions, window_size, overlap_size):
