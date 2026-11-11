@@ -75,11 +75,21 @@ class RoMaCoarseMatcher(nn.Module):
         return self.match_with_target(image_a, self.encode_target(image_b), image_b.shape[-2:])
 
     @torch.no_grad()
-    def match_with_target(self, image_a, target_features, target_size):
+    def match_with_target(self, image_a, target_features, target_size,
+                          return_hidden=False):
         f1_s = self.project_image(image_a)
         f2_s = target_features
         with torch.autocast(device_type=image_a.device.type, enabled=False):
             gp_posterior = self.gp(f1_s, f2_s)
+            if return_hidden:
+                hidden = self.embedding_decoder(gp_posterior, f1_s,
+                                                return_hidden=True)
+                batch, _, height, width = gp_posterior.shape
+                return {
+                    "roma_hidden": hidden,
+                    "grid_size": (height, width),
+                    "target_size": tuple(target_size),
+                }
             logits, no_match = self.embedding_decoder(gp_posterior, f1_s)
         batch, _, height, width = logits.shape
         logits = logits.flatten(2).transpose(1, 2)

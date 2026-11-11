@@ -1,4 +1,4 @@
-"""Compare trained Satellite Memory variants on MovingDrone_Long sequences."""
+"""Compare pure LoGeR and the trained RoMa Hidden Adapter."""
 
 import argparse
 import csv
@@ -16,7 +16,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from eval.datasets_preprocess.movingdrone import load_frames
 from eval.uav_satelitte.run_movingdrone import sim3
-from train.train_satellite_memory import build_model
+from train.satellite_tiles import build_model
 
 
 def tensor_to(value, device):
@@ -27,6 +27,17 @@ def tensor_to(value, device):
     if isinstance(value, tuple):
         return tuple(tensor_to(item, device) for item in value)
     return value
+
+
+def rigid_alignment(src, dst):
+    """Rigidly align row-vector points without fitting a scale."""
+    src_mean, dst_mean = src.mean(axis=0), dst.mean(axis=0)
+    u, _, vt = np.linalg.svd((src - src_mean).T @ (dst - dst_mean))
+    correction = np.eye(3)
+    correction[-1, -1] = np.linalg.det(u @ vt)
+    rotation = u @ correction @ vt
+    translation = dst_mean - src_mean @ rotation
+    return rotation, translation
 
 
 def load_dop(sequence):
@@ -76,7 +87,7 @@ def load_contiguous_frames(sequence, count, start_index, size=(448, 252)):
 
 
 def run_sequence(model, sequence, label, device, output, count, start_index=None,
-                full_trajectory=False):
+                full_trajectory=False, alignment="sim3"):
     if full_trajectory:
         with (sequence / "poses.csv").open(newline="") as file:
             count = sum(1 for _ in csv.DictReader(file))
@@ -91,13 +102,11 @@ def run_sequence(model, sequence, label, device, output, count, start_index=None
     tile = load_dop(sequence)[None].to(device)
     print(f"{label}: satellite image={next((sequence / name for name in ('dop_view.jpg', 'dop/2023_cropped.jpg', 'dop/2025_cropped.jpg', 'dop.jpg') if (sequence / name).is_file()), 'meta DOP')}", flush=True)
     with torch.no_grad():
-        sat_features = model.encode_roma_satellite(tile)
         normalized = (tile - model.image_mean) / model.image_std
         roma_target = model.roma_matcher.encode_target(normalized)
 
-    modes = ("off", "reset", "recurrent")
-    labels = {"off": "LoGeR", "reset": "Probabilistic, no memory",
-              "recurrent": "Probabilistic, recurrent memory"}
+    modes = ("off", "hidden")
+    labels = {"off": "LoGeR", "hidden": "RoMa Hidden Adapter"}
     result = {"frame_ids": frame_ids.tolist(), "modes": {}}
     trajectories = {}
     for mode in modes:
@@ -109,24 +118,17 @@ def run_sequence(model, sequence, label, device, output, count, start_index=None
             if starts[-1] != last:
                 starts.append(last)
             pieces = []
-            memory = None
             previous_end = 0
             for start in starts:
                 end = min(count, start + chunk_size)
                 chunk = images[:, start:end].to(device)
-                fresh = (torch.arange(start, end, device=device) >= previous_end)[None]
                 with torch.inference_mode(), torch.autocast(
                         "cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     prediction = model(
                         chunk,
                         roma_tile_image=tile,
-                        roma_tile_id=torch.tensor([0], device=device),
-                        roma_tile_bbox=torch.tensor([[0., 0., 1., 1.]], device=device),
-                        roma_satellite_features=tensor_to(sat_features, device),
                         roma_match_target_features=tensor_to(roma_target, device),
-                        roma_memory=memory if mode in ("recurrent", "shuffle") else None,
-                        roma_new_frame_mask=fresh,
-                        roma_memory_mode=mode,
+                        roma_fusion_mode=mode,
                         window_size=6,
                         overlap_size=2,
                         num_iterations=1,
@@ -136,12 +138,15 @@ def run_sequence(model, sequence, label, device, output, count, start_index=None
                 overlap = max(0, previous_end - start)
                 if pieces and overlap:
                     joined = np.concatenate(pieces, axis=0)
-                    scale_seg, rotation_seg, translation_seg = sim3(
-                        centers_part[:overlap], joined[-overlap:])
-                    centers_part = scale_seg * (centers_part @ rotation_seg.T) + translation_seg
+                    if alignment == "se3":
+                        rotation_seg, translation_seg = rigid_alignment(
+                            centers_part[:overlap], joined[-overlap:])
+                        centers_part = centers_part @ rotation_seg + translation_seg
+                    else:
+                        scale_seg, rotation_seg, translation_seg = sim3(
+                            centers_part[:overlap], joined[-overlap:])
+                        centers_part = scale_seg * (centers_part @ rotation_seg.T) + translation_seg
                 pieces.append(centers_part[overlap:])
-                if mode in ("recurrent", "shuffle"):
-                    memory = prediction["satellite_memory"]
                 previous_end = end
                 del prediction, chunk
                 if device.type == "cuda":
@@ -155,11 +160,8 @@ def run_sequence(model, sequence, label, device, output, count, start_index=None
                 prediction = model(
                     images,
                     roma_tile_image=tile,
-                    roma_tile_id=torch.tensor([0], device=device),
-                    roma_tile_bbox=torch.tensor([[0., 0., 1., 1.]], device=device),
-                    roma_satellite_features=tensor_to(sat_features, device),
                     roma_match_target_features=tensor_to(roma_target, device),
-                    roma_memory_mode=mode,
+                    roma_fusion_mode=mode,
                     window_size=6,
                     overlap_size=2,
                     num_iterations=1,
@@ -167,14 +169,21 @@ def run_sequence(model, sequence, label, device, output, count, start_index=None
                 )
             centers = prediction["camera_poses"][0, :, :3, 3].float().cpu().numpy().astype(np.float64)
             del prediction
-        scale, rotation, translation = sim3(centers, gt)
-        aligned = scale * (centers @ rotation.T) + translation
+        if alignment == "se3":
+            rotation, translation = rigid_alignment(centers, gt)
+            aligned = centers @ rotation + translation
+            scale = 1.0
+        else:
+            scale, rotation, translation = sim3(centers, gt)
+            aligned = scale * (centers @ rotation.T) + translation
         errors = np.linalg.norm(aligned - gt, axis=1)
         relative = np.linalg.norm(np.diff(aligned, axis=0) - np.diff(gt, axis=0), axis=1)
         result["modes"][mode] = {
             "ate_rmse_m": float(np.sqrt(np.mean(errors ** 2))),
             "ate_mean_m": float(errors.mean()),
             "relative_translation_rmse_m": float(np.sqrt(np.mean(relative ** 2))),
+            "alignment": alignment,
+            "alignment_scale": float(scale),
         }
         trajectories[mode] = aligned
         if device.type == "cuda":
@@ -186,12 +195,12 @@ def run_sequence(model, sequence, label, device, output, count, start_index=None
 
     fig, ax = plt.subplots(figsize=(9, 8), constrained_layout=True)
     ax.plot(gt[:, 0], gt[:, 1], "k--", linewidth=2.2, label="GT")
-    colors = {"off": "#4c78a8", "reset": "#f58518", "recurrent": "#54a24b"}
+    colors = {"off": "#4c78a8", "hidden": "#54a24b"}
     for mode in modes:
         ate = result["modes"][mode]["ate_rmse_m"]
         ax.plot(trajectories[mode][:, 0], trajectories[mode][:, 1],
                 color=colors[mode], linewidth=1.8, label=f"{labels[mode]} ({ate:.1f} m)")
-    ax.set_title(f"{label} | {count} {'consecutive' if full_trajectory else 'sampled'} frames")
+    ax.set_title(f"{label} | {count} {'consecutive' if full_trajectory else 'sampled'} frames | {alignment.upper()}")
     ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
     ax.axis("equal"); ax.grid(alpha=.25); ax.legend()
     fig.savefig(output / f"{label}.png", dpi=180)
@@ -201,7 +210,7 @@ def run_sequence(model, sequence, label, device, output, count, start_index=None
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="configs/satellite_memory_tiles.yaml")
+    parser.add_argument("--config", default="configs/roma_hidden_adapter_tiles.yaml")
     parser.add_argument("--root", type=Path, default=Path("/mnt/Data/RIght/MovingDrone_Long"))
     parser.add_argument("--scenes", nargs="+", default=["airport10", "olympiastadion1", "rural1"])
     parser.add_argument("--variant", default="baseline")
@@ -210,25 +219,29 @@ def main():
                         help="Evaluate contiguous clips sampled across each sequence; 0 uses uniform sparse sampling")
     parser.add_argument("--full-trajectory", action="store_true",
                         help="Evaluate every video frame in chronological order")
-    parser.add_argument("--output", type=Path, default=Path("runs/satellite_memory_long"))
+    parser.add_argument("--alignment", choices=("sim3", "se3"), default="sim3",
+                        help="Trajectory alignment; se3 rigidly aligns without scale fitting")
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--device")
     args = parser.parse_args()
 
     config = yaml.safe_load(Path(args.config).read_text())
+    if args.output is None:
+        args.output = Path(config["output"]) / "validation_64"
     device = torch.device(args.device or config["device"])
     model = build_model(config, device).eval()
     checkpoint = args.checkpoint or Path(config["output"]) / "best.pt"
     state = torch.load(checkpoint, map_location="cpu", weights_only=True)
-    model.satellite_probabilistic.load_state_dict(state["satellite_probabilistic"])
-
+    model.roma_loger_fusion.load_state_dict(state["roma_loger_fusion"])
     all_results = {}
     for name in args.scenes:
         sequence = args.root / name / args.variant if args.variant else args.root / name
         label = name.replace("/", "_")
         if args.full_trajectory:
             result = run_sequence(model, sequence, label, device, args.output,
-                                  args.frames, full_trajectory=True)
+                                  args.frames, full_trajectory=True,
+                                  alignment=args.alignment)
             all_results[label] = result["modes"]
         elif args.contiguous_clips:
             with (sequence / "poses.csv").open(newline="") as file:
@@ -239,7 +252,8 @@ def main():
             for index, start in enumerate(starts):
                 result = run_sequence(model, sequence, f"{label}_clip{index + 1:02d}",
                                       device, args.output, args.frames,
-                                      start_index=int(start))
+                                      start_index=int(start),
+                                      alignment=args.alignment)
                 clips.append({"start_frame": int(start), "metrics": result["modes"]})
             averages = {
                 mode: {key: float(np.mean([clip["metrics"][mode][key] for clip in clips]))
@@ -249,7 +263,8 @@ def main():
             all_results[label] = {"mean_over_contiguous_clips": averages, "clips": clips}
             print(label, "mean over contiguous clips", averages, flush=True)
         else:
-            result = run_sequence(model, sequence, label, device, args.output, args.frames)
+            result = run_sequence(model, sequence, label, device, args.output, args.frames,
+                                  alignment=args.alignment)
             all_results[label] = result["modes"]
     (args.output / "summary.json").write_text(json.dumps(all_results, indent=2))
     print(f"Saved Long evaluation to {args.output}", flush=True)

@@ -17,10 +17,13 @@ class TransformerDecoder(nn.Module):
         ])
         self.to_out = nn.Linear(1024, 64 * 64 + 1)
 
-    def forward(self, gp_posterior, features):
+    def forward(self, gp_posterior, features, return_hidden=False):
         batch, _, height, width = gp_posterior.shape
         with torch.autocast(device_type=gp_posterior.device.type, enabled=False):
             tokens = torch.cat((gp_posterior, features), dim=1).flatten(2).transpose(1, 2)
-            output = self.to_out(self.blocks(tokens.float()))
+            hidden = self.blocks(tokens.float())
+            if return_hidden:
+                return hidden
+            output = self.to_out(hidden)
         output = output.transpose(1, 2).reshape(batch, 4097, height, width)
         return output[:, :4096], output[:, 4096:]

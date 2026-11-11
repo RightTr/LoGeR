@@ -42,7 +42,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sequence", type=Path,
                         default=Path("/mnt/Data/RIght/MovingDrone_Tiles/airport10/tile01"))
-    parser.add_argument("--config", type=Path, default=Path("configs/satellite_memory_tiles.yaml"))
+    parser.add_argument("--config", type=Path, default=Path("configs/roma_hidden_adapter_tiles.yaml"))
     parser.add_argument("--frame-id", type=int, default=500)
     parser.add_argument("--device", default="cuda:1")
     parser.add_argument("--output", type=Path,
