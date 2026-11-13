@@ -10,10 +10,10 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 from PIL import Image
 
-from ..dinov2.hub.backbones import dinov2_vits14_reg
+from .dinov2.hub.backbones import dinov2_vits14_reg
 
 
-class SatelliteTiledDINO(nn.Module):
+class SatelliteEncoder(nn.Module):
     """Frozen DINOv2-S/14-Reg with tiled full-map inference and feathered blending."""
 
     patch_size = 14
@@ -25,8 +25,7 @@ class SatelliteTiledDINO(nn.Module):
     def __init__(self, pretrained: bool = True, tile_batch_size: int = 4):
         super().__init__()
         self.backbone = dinov2_vits14_reg(pretrained=pretrained)
-        if hasattr(self.backbone, "mask_token"):
-            del self.backbone.mask_token
+        del self.backbone.mask_token
         self.tile_batch_size = int(tile_batch_size)
         self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
@@ -84,8 +83,6 @@ class SatelliteTiledDINO(nn.Module):
                 y_mask = (global_y >= y0) & (global_y < y0 + tile)
                 xs = torch.where(x_mask)[0]
                 ys = torch.where(y_mask)[0]
-                if xs.numel() == 0 or ys.numel() == 0:
-                    continue
                 px = global_x[xs] - x0
                 py = global_y[ys] - y0
                 gx = 2.0 * px / tile - 1.0
@@ -101,7 +98,4 @@ class SatelliteTiledDINO(nn.Module):
                 feature_sum[:, :, ys[:, None], xs[None, :]] += sampled * blend
                 weight_sum[:, :, ys[:, None], xs[None, :]] += blend
 
-        dense = feature_sum / weight_sum.clamp_min(1e-6)
-        if not torch.isfinite(dense).all():
-            raise RuntimeError(f"Non-finite tiled DINO features for {path}")
-        return dense
+        return feature_sum / weight_sum.clamp_min(1e-6)

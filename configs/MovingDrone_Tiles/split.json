@@ -1,0 +1,21 @@
+{
+  "seed": 42,
+  "train": [
+    "/mnt/Data/RIght/MovingDrone_Tiles/industrial9/tile01",
+    "/mnt/Data/RIght/MovingDrone_Tiles/wienerstr/tile01",
+    "/mnt/Data/RIght/MovingDrone_Tiles/elsenstr/tile02",
+    "/mnt/Data/RIght/MovingDrone_Tiles/elsenstr/tile01",
+    "/mnt/Data/RIght/MovingDrone_Tiles/wienerstr/tile02",
+    "/mnt/Data/RIght/MovingDrone_Tiles/suburban9/tile01",
+    "/mnt/Data/RIght/MovingDrone_Tiles/bundestag1/tile03",
+    "/mnt/Data/RIght/MovingDrone_Tiles/berliner_dom4/tile01",
+    "/mnt/Data/RIght/MovingDrone_Tiles/rural1/tile01",
+    "/mnt/Data/RIght/MovingDrone_Tiles/bundestag1/tile01",
+    "/mnt/Data/RIght/MovingDrone_Tiles/bundestag1/tile02"
+  ],
+  "val": [
+    "/mnt/Data/RIght/MovingDrone_Tiles/airport10/tile01",
+    "/mnt/Data/RIght/MovingDrone_Tiles/airport10/tile02",
+    "/mnt/Data/RIght/MovingDrone_Tiles/schloss_charlottenburg10/tile01"
+  ]
+}

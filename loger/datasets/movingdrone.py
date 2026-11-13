@@ -1,4 +1,4 @@
-"""MovingDrone dataset with lazy RGB, pose, and geometry outputs."""
+"""MovingDrone dataset for explicit sequence paths, RGB, pose, and geometry."""
 
 import csv
 import json
@@ -14,23 +14,25 @@ from .base import BaseSequenceDataset
 
 
 class MovingDroneDataset(BaseSequenceDataset):
-    def __init__(self, root, variant="baseline", output="rgb", dop_year="2023", **kwargs):
-        if output not in ("rgb", "pose", "geometry"):
-            raise ValueError("output must be 'rgb', 'pose', or 'geometry'")
+    def __init__(self, sequence_paths, output="rgb", dop_year="2023", **kwargs):
+        if output not in ("rgb", "pose", "geometry", "training"):
+            raise ValueError("output must be rgb, pose, geometry, or training")
         self.output = output
         self.dop_year = str(dop_year)
         self.scene_cache = {}
-        scenes = kwargs.pop("scenes", None)
-        if not scenes:
-            raise ValueError("Pass configured scene names with scenes=(...)")
-        sequence_paths = [Path(root) / scene / str(variant) for scene in scenes]
-        super().__init__(sequence_paths, **kwargs)
+        self.paths = [Path(path) for path in sequence_paths]
+        super().__init__(self.paths, **kwargs)
 
     def _index_frame_ids(self, sequence, video_frame_count):
         if self.output == "rgb":
             return list(range(video_frame_count))
         return [frame_id for frame_id in sorted(self.load_poses(sequence))
                 if 0 <= frame_id < video_frame_count]
+
+    def __getitem__(self, index):
+        sample = super().__getitem__(index)
+        sample["sequence"] = str(self.index[index][0])
+        return sample
 
     def load_poses(self, sequence):
         cache = self.scene_cache.setdefault(sequence, {})
@@ -95,6 +97,30 @@ class MovingDroneDataset(BaseSequenceDataset):
             pose_mats.append(torch.from_numpy(pose.copy()))
             quaternions.append(torch.from_numpy(quaternion.copy()))
         pose_mats = torch.stack(pose_mats)
+        relative_poses = torch.linalg.inv(pose_mats[:1]) @ pose_mats
+        if self.output == "training":
+            native_h, native_w, raw_K = self.load_intrinsics(sequence)
+            out_h, out_w = self.image_size
+            K = raw_K.clone()
+            K[0, 0] *= out_w / native_w
+            K[1, 1] *= out_h / native_h
+            K[0, 2] = (K[0, 2] + .5) * (out_w / native_w) - .5
+            K[1, 2] = (K[1, 2] + .5) * (out_h / native_h) - .5
+            depth_info = json.loads((sequence / "depth" / "metadata.json").read_text())
+            depths = []
+            for frame_id in frame_ids:
+                raw = cv2.imread(str(sequence / "depth" / f"depth_{frame_id:06d}.png"),
+                                 cv2.IMREAD_UNCHANGED)
+                depth = raw.astype(np.float32) * float(depth_info["scale_m_per_unit"])
+                depth[raw == 0] = 0
+                depth = cv2.resize(depth, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+                depths.append(torch.from_numpy(depth.copy()))
+            return {
+                "poses": relative_poses,
+                "depth": torch.stack(depths),
+                "K": K.expand(len(frame_ids), -1, -1).clone(),
+            }
+
         values = {
             "pose_c2w": pose_mats,
             "position_xyz": pose_mats[:, :3, 3],

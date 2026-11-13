@@ -1,11 +1,11 @@
-variant: B_region_joint_no_r2l
-use_region_to_local: false
-device: cuda:0
-dataset_root: /mnt/Data/RIght/MovingDrone_Tiles
-satellite_image: dop_view.jpg
+variant: R2LA_hierarchical_local_pe
+r2la_enabled: true
+train_only_r2la: true
+initial_checkpoint: runs/sgga_c_r2la_fixed_3000_v2/best.pt
+device: cuda:1
 model_config: ckpts/LoGeR_star/original_config.yaml
 loger_checkpoint: ckpts/LoGeR_star/latest.pt
-split_file: runs/roma_hidden_adapter_tiles_v2/split.json
+split_file: configs/MovingDrone_Tiles/split.json
 seed: 42
 image_size: [252, 448]
 sample_stride: 10
@@ -20,4 +20,4 @@ weight_decay: 0.01
 lambda_global: 0.5
 lambda_rotation: 0.1
 lambda_translation: 10.0
-output: runs/satellite_region_b_3000
+output: runs/sgga_c_r2la_hierarchical_pe_3000

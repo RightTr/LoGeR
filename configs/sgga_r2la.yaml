@@ -1,0 +1,21 @@
+variant: SGGA_R2LA
+r2la_enabled: true
+device: cuda:1
+model_config: ckpts/LoGeR_star/original_config.yaml
+loger_checkpoint: ckpts/LoGeR_star/latest.pt
+split_file: configs/MovingDrone_Tiles/split.json
+seed: 42
+image_size: [252, 448]
+sample_stride: 10
+window_size: 6
+overlap_size: 2
+tile_batch_size: 4
+steps: 3000
+validate_every: 100
+val_steps: 24
+learning_rate: 0.0001
+weight_decay: 0.01
+lambda_global: 0.5
+lambda_rotation: 0.1
+lambda_translation: 10.0
+output: runs/sgga_c_r2la_fixed_3000_v2

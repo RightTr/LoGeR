@@ -1,7 +1,5 @@
 """UAV image encoder based on the LoGeR DINOv2-L/14-Reg backbone."""
 
-from collections import OrderedDict
-
 import torch.nn as nn
 
 from .dinov2.hub.backbones import dinov2_vitl14_reg
@@ -20,30 +18,12 @@ class UAVEncoder(nn.Module):
 
     @staticmethod
     def remap_state_dict(state_dict):
-        """Map legacy and intermediate Pi3 UAV keys to this encoder's layout."""
-        def remap(key):
-            if key == "encoder" or key.startswith("encoder."):
-                return "uav_encoder.backbone" + key[len("encoder"):]
-            if key == "uav_encoder" or (
-                key.startswith("uav_encoder.") and not key.startswith("uav_encoder.backbone.")
-            ):
-                return "uav_encoder.backbone" + key[len("uav_encoder"):]
-            return key
-
-        remapped = OrderedDict()
+        """Map older encoder prefixes to the current backbone prefix."""
+        remapped = {}
         for key, value in state_dict.items():
-            new_key = remap(key)
-            if new_key in remapped:
-                raise RuntimeError(f"Checkpoint contains conflicting parameter keys for {new_key!r}")
-            remapped[new_key] = value
-
-        if hasattr(state_dict, "_metadata"):
-            metadata = OrderedDict()
-            for key, value in state_dict._metadata.items():
-                new_key = remap(key)
-                if new_key in metadata:
-                    raise RuntimeError(f"Checkpoint contains conflicting module metadata for {new_key!r}")
-                metadata[new_key] = value
-            remapped._metadata = metadata
-
+            if key.startswith("encoder."):
+                key = "uav_encoder.backbone." + key[len("encoder."):]
+            elif key.startswith("uav_encoder.") and not key.startswith("uav_encoder.backbone."):
+                key = "uav_encoder.backbone." + key[len("uav_encoder."):]
+            remapped[key] = value
         return remapped

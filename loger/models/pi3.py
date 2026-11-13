@@ -11,9 +11,8 @@ from .layers.pos_embed import RoPE2D, PositionGetter
 from .layers.block import BlockRope
 from .layers.attention import FlashAttentionRope
 from .layers.swa import SWA
-from .layers.roma_loger_fusion import RoMaLoGeRFusion
-from .layers.satellite_region_attention import SatelliteRegionPyramid
-from roma import RoMaCoarseMatcher
+from .layers.sgga import SGGA
+from .layers.r2la import R2LA
 from .layers.transformer_head import TransformerDecoder, LinearPts3d, ContextOnlyTransformerDecoder
 from .layers.camera_head import CameraHead
 from .layers.conv_head import ConvHead
@@ -37,14 +36,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             ttt_pre_norm: bool = False,
             pi3x: bool = False,
             pi3x_metric: bool = True,
-            roma_enabled: bool = False,
-            roma_checkpoint: Optional[str] = None,
-            roma_dino_checkpoint: Optional[str] = None,
-            roma_encode_batch_size: int = 8,
             decoder_gradient_checkpointing: bool = False,
             ttt_gradient_checkpointing: Optional[bool] = None,
-            satellite_region_enabled: bool = False,
-            satellite_region_use_r2l: bool = True,
+            sgga_enabled: bool = False,
+            r2la_enabled: bool = False,
         ):
         super().__init__()
 
@@ -131,28 +126,21 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 rope=self.rope
             ) for _ in range(dec_depth)])
         self.dec_embed_dim = dec_embed_dim
-        self.roma_enabled = bool(roma_enabled)
-        self.satellite_region_enabled = bool(satellite_region_enabled)
-        if self.satellite_region_enabled and self.roma_enabled:
-            raise ValueError("Satellite Region Attention is independent of RoMa")
-        if self.satellite_region_enabled:
+        self.sgga_enabled = bool(sgga_enabled)
+        self.r2la_enabled = bool(r2la_enabled)
+        if self.r2la_enabled and not self.sgga_enabled:
+            raise ValueError("R2LA requires SGGA to be enabled")
+        if self.sgga_enabled:
             if dec_embed_dim != 1024:
-                raise ValueError("Satellite Region Attention requires the 1024D LoGeR-large decoder")
-            self.satellite_region = SatelliteRegionPyramid(
-                in_dim=384, region_dim=dec_embed_dim,
-                use_region_to_local=satellite_region_use_r2l)
-        self.roma_encode_batch_size = int(roma_encode_batch_size)
+                raise ValueError("SGGA requires the 1024D LoGeR-large decoder")
+            self.sgga = SGGA(
+                in_dim=384, region_dim=dec_embed_dim)
+            if self.r2la_enabled:
+                self.r2la = R2LA(in_dim=384, region_dim=dec_embed_dim)
         self.decoder_gradient_checkpointing = bool(decoder_gradient_checkpointing)
         self.ttt_gradient_checkpointing = (
             self.decoder_gradient_checkpointing if ttt_gradient_checkpointing is None
             else bool(ttt_gradient_checkpointing))
-        if self.roma_enabled:
-            assert self.attn_insert_after and 0 <= min(self.attn_insert_after) < len(self.decoder), \
-                "RoMa fusion requires a valid SWA insertion position"
-            self.roma_fusion_after = min(self.attn_insert_after)
-            self.roma_matcher = RoMaCoarseMatcher(roma_dino_checkpoint, roma_checkpoint)
-            self.roma_loger_fusion = RoMaLoGeRFusion(dim=dec_embed_dim)
-
         # ----------------------
         #     Register_token
         # ----------------------
@@ -289,71 +277,28 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             insert_after=self.attn_insert_after,
             rope=self.rope,
         )
-        if self.roma_enabled:
+        if self.sgga_enabled:
             for name, parameter in self.named_parameters():
-                parameter.requires_grad_(name.startswith("roma_loger_fusion."))
-            self.roma_matcher.eval()
-        elif self.satellite_region_enabled:
-            for name, parameter in self.named_parameters():
-                parameter.requires_grad_(name.startswith("satellite_region."))
+                parameter.requires_grad_(name.startswith(("sgga.", "r2la.")))
 
     def train(self, mode=True):
         super().train(mode)
-        if self.roma_enabled or self.satellite_region_enabled:
+        if self.sgga_enabled:
             self.uav_encoder.eval()
-        if self.roma_enabled:
-            self.roma_matcher.eval()
         return self
-
-    @torch.no_grad()
-    def _roma_hidden(self, imgs, tile_image, uav_grid, target_features=None):
-        """Return the final RoMa decoder token for each UAV image patch."""
-        batch, frames, _, _, _ = imgs.shape
-        tile_image = tile_image.to(self.image_mean.device)
-        target = target_features
-        if target is None:
-            target = self.roma_matcher.encode_target(
-                (tile_image - self.image_mean) / self.image_std)
-        frame_hidden = []
-        expected_grid = tuple(uav_grid)
-        expected_patches = expected_grid[0] * expected_grid[1]
-        for batch_idx in range(batch):
-            sample_hidden = []
-            for frame_idx in range(frames):
-                image = imgs[batch_idx, frame_idx:frame_idx + 1].to(self.image_mean.device)
-                image = (image - self.image_mean) / self.image_std
-                result = self.roma_matcher.match_with_target(
-                    image, target[batch_idx:batch_idx + 1], tile_image.shape[-2:],
-                    return_hidden=True)
-                if tuple(result["grid_size"]) != expected_grid:
-                    raise ValueError(
-                        f"RoMa patch grid {result['grid_size']} does not match "
-                        f"LoGeR patch grid {expected_grid}; resize/crop inputs consistently")
-                hidden = result["roma_hidden"]
-                if hidden.shape[1:] != (expected_patches, self.dec_embed_dim):
-                    raise ValueError(
-                        f"Unexpected RoMa hidden shape {tuple(hidden.shape)} for "
-                        f"grid {expected_grid} and dim {self.dec_embed_dim}")
-                sample_hidden.append(hidden)
-            frame_hidden.append(torch.cat(sample_hidden, dim=0))
-        hidden = torch.stack(frame_hidden, dim=0).reshape(
-            batch, frames, expected_patches, self.dec_embed_dim)
-        return hidden
-
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         """Load checkpoints using UAVEncoder's key compatibility mapping."""
         remapped = SWA.remap_state_dict(UAVEncoder.remap_state_dict(state_dict))
         for key in list(remapped):
             if ((key.startswith("satellite_") and not key.startswith(
-                    "satellite_region.")) or
-                    key.startswith("pyramid_attention.") or
-                    key.startswith(("roma_encoder.", "roma_adapter."))):
+                    "sgga.")) or
+                    key.startswith("pyramid_attention.")):
                 del remapped[key]
         incompatible = super().load_state_dict(remapped, strict=False, assign=assign)
         if strict:
             allowed = ()
-            for prefix in ("roma_matcher.", "roma_loger_fusion.", "satellite_region."):
+            for prefix in ("sgga.", "r2la."):
                 if not any(key.startswith(prefix) for key in remapped):
                     allowed += (prefix,)
             missing = [key for key in incompatible.missing_keys if not key.startswith(allowed)]
@@ -410,16 +355,14 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         self._initialize_ttt_layers_from_global(self.swa.layers, "swa", self.attn_insert_after)
 
     def decode(self, hidden, N, H, W, ttt_dict: Optional[dict] = None, window_size: Optional[int] = None, overlap_size: Optional[int] = None, is_first_window: bool = False,
-               turn_off_ttt=False, turn_off_swa=False, fusion=None,
-               satellite_region_tokens=None,
-               satellite_local_pyramid=()) -> torch.Tensor:
+               turn_off_ttt=False, turn_off_swa=False,
+               sgga_tokens=None,
+               r2la_local_tokens=None) -> torch.Tensor:
         BN, hw, _ = hidden.shape
         B = BN // N
 
         final_output = []
-        satellite_fusion_stats = None
-        region_tokens = satellite_region_tokens
-        previous_local = None
+        region_tokens = sgga_tokens
         
         hidden = hidden.reshape(B*N, hw, -1)
 
@@ -490,15 +433,15 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             else:
                 hidden_before_block = hidden_for_block # dummy
 
-            if (self.satellite_region_enabled and i in SatelliteRegionPyramid.global_decoder_indices
+            if (self.sgga_enabled and i in SGGA.sgga_decoder_indices
                     and region_tokens is not None):
                 from torch.utils.checkpoint import checkpoint
-                stage = SatelliteRegionPyramid.global_decoder_indices.index(i)
+                stage = SGGA.sgga_decoder_indices.index(i)
                 region_pos = torch.zeros(
                     B, region_tokens.shape[1], 2, device=pos_for_block.device,
                     dtype=pos_for_block.dtype)
-                joint_pos = torch.cat((pos_for_block, region_pos), dim=1)
-                joint_input = torch.cat((hidden_for_block, region_tokens), dim=1)
+                sgga_pos = torch.cat((pos_for_block, region_pos), dim=1)
+                sgga_input = torch.cat((hidden_for_block, region_tokens), dim=1)
 
                 def run_block(tokens, block=blk, xpos=pos_for_block):
                     return block(tokens, xpos=xpos)
@@ -507,20 +450,19 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                                if self.training and self.decoder_gradient_checkpointing
                                and hidden_for_block.requires_grad else run_block(hidden_for_block))
 
-                def run_joint(tokens, block=blk, xpos=joint_pos):
+                def run_sgga(tokens, block=blk, xpos=sgga_pos):
                     return block(tokens, xpos=xpos)
 
-                joint_output = (checkpoint(run_joint, joint_input, use_reentrant=False)
+                sgga_output = (checkpoint(run_sgga, sgga_input, use_reentrant=False)
                                 if self.training and self.decoder_gradient_checkpointing
-                                and joint_input.requires_grad else run_joint(joint_input))
-                joint_hidden = joint_output[:, :hidden_for_block.shape[1]]
-                region_tokens = joint_output[:, hidden_for_block.shape[1]:]
-                gate = self.satellite_region.joint_gates[stage].to(base_hidden.dtype)
-                hidden = base_hidden + gate * (joint_hidden - base_hidden)
-                if self.satellite_region.use_region_to_local:
-                    region_tokens, previous_local = self.satellite_region.refine(
-                        region_tokens, satellite_local_pyramid[stage], stage,
-                        previous_local)
+                                and sgga_input.requires_grad else run_sgga(sgga_input))
+                sgga_uav = sgga_output[:, :hidden_for_block.shape[1]]
+                region_tokens = sgga_output[:, hidden_for_block.shape[1]:]
+                gate = self.sgga.sgga_gates[stage].to(base_hidden.dtype)
+                hidden = base_hidden + gate * (sgga_uav - base_hidden)
+                if self.r2la_enabled and i in R2LA.decoder_indices:
+                    r2la_stage = R2LA.decoder_indices.index(i)
+                    region_tokens = self.r2la(region_tokens, r2la_local_tokens, r2la_stage)
             elif (self.training and self.decoder_gradient_checkpointing
                     and hidden_for_block.requires_grad):
                 from torch.utils.checkpoint import checkpoint
@@ -581,19 +523,6 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 ttt_output_info["w1"][layer_idx] = output["w1"]
                 ttt_output_info["w2"][layer_idx] = output["w2"]
 
-            # RoMa Hidden enters before the first SWA.
-            if fusion is not None and i == self.roma_fusion_after:
-                hidden_by_frame = hidden.reshape(B, N, hw, -1)
-                patches = hidden_by_frame[:, :, self.patch_start_idx:]
-                delta, satellite_fusion_stats = self.roma_loger_fusion(
-                    patches, fusion["roma_hidden"])
-                patches = patches + delta.to(patches.dtype)
-                hidden_by_frame = torch.cat((
-                    hidden_by_frame[:, :, :self.patch_start_idx],
-                    patches), dim=2)
-                hidden = (hidden_by_frame.reshape(B * N, hw, -1) if i % 2 == 0
-                          else hidden_by_frame.reshape(B, N * hw, -1))
-
             # Sliding Window Attention (SWA)
             if attn_state is not None and i in attn_state.get("insert_after", []):
                 insert_after_list = attn_state.get("insert_after", [])
@@ -645,14 +574,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             avg_gate_scale,
             avg_attn_gate_scale,
             gate_scales,
-            satellite_fusion_stats,
         )
     
     def forward(self, imgs, *args, **kwargs):
         # Windowing controls (optional)
-        roma_tile_image = kwargs.pop("roma_tile_image", None)
-        roma_match_target_features = kwargs.pop("roma_match_target_features", None)
-        roma_fusion_mode = kwargs.pop("roma_fusion_mode", "off")
         window_size = kwargs.pop('window_size', -1)
         overlap_size = kwargs.pop('overlap_size', 1)
         num_iterations = kwargs.pop('num_iterations', 1)
@@ -663,13 +588,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         turn_off_ttt = kwargs.pop('turn_off_ttt', False)
         turn_off_swa = kwargs.pop('turn_off_swa', False)
         sim3_scale_mode = kwargs.pop('sim3_scale_mode', 'median')
-        satellite_region_features = kwargs.pop("satellite_region_features", None)
+        satellite_features = kwargs.pop("satellite_features", None)
 
         if sim3 and se3:
             raise ValueError("'sim3' and 'se3' alignments are mutually exclusive; enable only one.")
-        if roma_fusion_mode not in ("off", "hidden"):
-            raise ValueError("roma_fusion_mode must be off or hidden")
-
         # Ensure at least one decode iteration so that 'hidden' is always defined
         try:
             num_iterations = int(num_iterations)
@@ -694,33 +616,16 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         B, N, C, H, W = imgs.shape
         patch_h, patch_w = H // 14, W // 14
 
-        cached_uav = None
-        satellite_region_base = None
-        satellite_local_pyramid = ()
-        if self.satellite_region_enabled:
-            if satellite_region_features is None:
-                raise ValueError("Satellite Region Attention requires satellite_region_features")
-            satellite_region_features = satellite_region_features.to(
+        sgga_base = None
+        r2la_local_tokens = None
+        if self.sgga_enabled:
+            if satellite_features is None:
+                raise ValueError("SGGA requires satellite_features")
+            satellite_features = satellite_features.to(
                 self.image_mean.device, non_blocking=True)
-            satellite_region_base, satellite_local_pyramid = self.satellite_region.initialize(
-                satellite_region_features)
-        roma_active = self.roma_enabled and roma_fusion_mode == "hidden"
-        roma_hidden_all = None
-        if roma_active:
-            target_features = roma_match_target_features
-            roma_hidden_all = self._roma_hidden(
-                imgs, roma_tile_image, (patch_h, patch_w), target_features)
-            # Encode each frame exactly once, including overlapping windows.
-            flat = imgs.reshape(B * N, C, H, W)
-            chunks = []
-            with torch.no_grad():
-                for part in flat.split(self.roma_encode_batch_size):
-                    part = part.to(self.image_mean.device)
-                    part = (part - self.image_mean) / self.image_std
-                    encoded = self.uav_encoder(part, is_training=True)
-                    chunks.append(encoded["x_norm_patchtokens"] if isinstance(encoded, dict) else encoded)
-            cached_uav = torch.cat(chunks, dim=0).reshape(B, N, -1, 1024)
-
+            sgga_base = self.sgga.initialize(satellite_features)
+            if self.r2la_enabled:
+                r2la_local_tokens = self.r2la.prepare_local_tokens(satellite_features)
         # --- Unified Windowed Inference ---
         if window_size <= 0 or window_size >= N:
             windows = [(0, N)]
@@ -764,7 +669,6 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         all_predictions = []
         all_gate_scales: List[torch.Tensor] = []
         all_attn_gate_scales: List[torch.Tensor] = []
-        fusion_stat_history = []
         
         windows_iter = windows
         for window_idx, (start_idx, end_idx) in enumerate(windows_iter):
@@ -774,17 +678,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             imgs_w = imgs_w.to(self.image_mean.device)
             imgs_w = (imgs_w - self.image_mean) / self.image_std
             Nw = imgs_w.shape[1]
-            fusion = None
-            if cached_uav is not None:
-                uav_features = cached_uav[:, start_idx:end_idx].reshape(B * Nw, -1, 1024)
-                fusion = {
-                    "roma_hidden": roma_hidden_all[:, start_idx:end_idx],
-                }
-
             # Initialize to satisfy static analyzers; will be set inside decode loop
             hidden = None  # type: ignore[assignment]
             pos = None     # type: ignore[assignment]
-            satellite_fusion_stats = None
 
             for iteration in range(num_iterations):
                 if self.ttt_layers is not None and w0 is None:
@@ -795,13 +691,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 if self.swa.layers and swa_history is None:
                     swa_history = [None] * len(self.attn_insert_after)
 
-                if cached_uav is None:
-                    imgs_flat = imgs_w.reshape(B * Nw, C, H, W)
-                    hidden_input = self.uav_encoder(imgs_flat, is_training=True)
-                    if isinstance(hidden_input, dict):
-                        hidden_input = hidden_input["x_norm_patchtokens"]
-                else:
-                    hidden_input = uav_features
+                imgs_flat = imgs_w.reshape(B * Nw, C, H, W)
+                hidden_input = self.uav_encoder(imgs_flat, is_training=True)
+                if isinstance(hidden_input, dict):
+                    hidden_input = hidden_input["x_norm_patchtokens"]
 
                 # Prepare adapter control dictionaries for decode
                 ttt_state = None
@@ -829,7 +722,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "ttt": ttt_state,
                         "attn": attn_state,
                     }
-                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, satellite_fusion_stats = self.decode(
+                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales = self.decode(
                     hidden_input, Nw, H, W,
                     ttt_dict=ttt_dict,
                     window_size=window_size,
@@ -837,12 +730,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     is_first_window=(start_idx == 0),
                     turn_off_ttt=turn_off_ttt,
                     turn_off_swa=turn_off_swa,
-                    fusion=fusion,
-                    satellite_region_tokens=satellite_region_base,
-                    satellite_local_pyramid=satellite_local_pyramid,
+                    sgga_tokens=sgga_base,
+                    r2la_local_tokens=r2la_local_tokens,
                 )
-                if satellite_fusion_stats is not None:
-                    fusion_stat_history.append(satellite_fusion_stats)
                 if decode_avg_gate_scale is not None:
                     all_gate_scales.append(decode_avg_gate_scale.detach().cpu())
                 if decode_avg_attn_gate_scale is not None:
@@ -964,11 +854,6 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
         if all_attn_gate_scales:
             merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
-        if roma_active:
-            if fusion_stat_history:
-                for key in fusion_stat_history[0]:
-                    merged[f"roma_hidden_fusion_{key}"] = torch.stack(
-                        [stats[key].detach() for stats in fusion_stat_history]).mean()
         return merged
 
     def _merge_windowed_predictions(self, all_predictions, window_size, overlap_size):
