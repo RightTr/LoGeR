@@ -193,14 +193,25 @@ def run_sequence(model, sequence, label, device, output, count, start_index=None
     output.mkdir(parents=True, exist_ok=True)
     (output / f"{label}.json").write_text(json.dumps(result, indent=2))
 
-    fig, ax = plt.subplots(figsize=(9, 8), constrained_layout=True)
-    ax.plot(gt[:, 0], gt[:, 1], "k--", linewidth=2.2, label="GT")
+    fig, ax = plt.subplots(figsize=(11, 9), constrained_layout=True)
+    ax.plot(gt[:, 0], gt[:, 1], "k--", linewidth=2.0, marker="o",
+            markersize=3.2, label="GT sampled anchors", zorder=3)
     colors = {"off": "#4c78a8", "hidden": "#54a24b"}
     for mode in modes:
         ate = result["modes"][mode]["ate_rmse_m"]
         ax.plot(trajectories[mode][:, 0], trajectories[mode][:, 1],
-                color=colors[mode], linewidth=1.8, label=f"{labels[mode]} ({ate:.1f} m)")
-    ax.set_title(f"{label} | {count} {'consecutive' if full_trajectory else 'sampled'} frames | {alignment.upper()}")
+                color=colors[mode], linewidth=1.6, marker="o", markersize=2.8,
+                label=f"{labels[mode]} ({ate:.1f} m)", zorder=2)
+    # Mark every eighth sample with its source video frame ID on the GT path.
+    for index in range(0, len(frame_ids), 8):
+        x, y = gt[index, :2]
+        ax.annotate(str(int(frame_ids[index])), (x, y), xytext=(4, 5),
+                    textcoords="offset points", fontsize=7, color="black",
+                    bbox={"boxstyle": "round,pad=0.15", "fc": "white",
+                          "ec": "none", "alpha": 0.75}, zorder=4)
+    ax.set_title(
+        f"{label} | {count} {'consecutive' if full_trajectory else 'sampled'} frames "
+        f"| {alignment.upper()}\nDots mark frame anchors; labels are source frame IDs")
     ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
     ax.axis("equal"); ax.grid(alpha=.25); ax.legend()
     fig.savefig(output / f"{label}.png", dpi=180)

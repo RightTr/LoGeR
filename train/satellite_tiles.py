@@ -60,8 +60,6 @@ class TileWindows(Dataset):
         out_h, out_w = self.image_size
         images = []
         for frame_id in frame_ids:
-            if self.captures[sequence_key][1] != frame_id:
-                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
             ok, frame = capture.read()
             if not ok:
                 raise RuntimeError(f"Video decode failed: {sequence} frame={frame_id}")
@@ -143,7 +141,7 @@ def build_model(config, device):
     options.update(roma_enabled=True,
                    roma_checkpoint=config["matchanything_checkpoint"],
                    roma_dino_checkpoint=config["roma_dino_checkpoint"],
-                   roma_gradient_checkpointing=True)
+                   decoder_gradient_checkpointing=True)
     model = Pi3(**options)
     checkpoint = torch.load(config["loger_checkpoint"], map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
